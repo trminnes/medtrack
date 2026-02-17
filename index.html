@@ -187,7 +187,7 @@
                 // Microsoft Graph API authentication
                 const clientId = '10561a6c-405f-47fe-b0d9-4d14faa239e9'; // User needs to replace this
 
-                const redirectUri = 'https://login.microsoftonline.com/common/oauth2/nativeclient';
+                const redirectUri = 'https://trminnes.github.io/medtrack/';
                 const scopes = 'Files.ReadWrite offline_access';
 
                 // Build auth URL
@@ -884,10 +884,10 @@
                                                 <div
                                                     key={time}
                                                     className={`flex items-center justify-between p-3 rounded-lg border-2 transition-all ${isTaken
-                                                            ? 'bg-green-50 border-green-300'
-                                                            : isPast
-                                                                ? 'bg-red-50 border-red-300'
-                                                                : 'bg-gray-50 border-gray-300 hover:border-blue-400'
+                                                        ? 'bg-green-50 border-green-300'
+                                                        : isPast
+                                                            ? 'bg-red-50 border-red-300'
+                                                            : 'bg-gray-50 border-gray-300 hover:border-blue-400'
                                                         }`}
                                                 >
                                                     <div className="flex items-center gap-3">
@@ -1099,7 +1099,7 @@
                                                             </div>
                                                             <div className="text-right">
                                                                 <p className={`text-lg font-bold ${test.status === 'normal' ? 'text-green-600' :
-                                                                        test.status === 'high' ? 'text-red-600' : 'text-orange-600'
+                                                                    test.status === 'high' ? 'text-red-600' : 'text-orange-600'
                                                                     }`}>
                                                                     {test.value} {test.unit}
                                                                 </p>
@@ -1115,7 +1115,7 @@
                                                             </div>
                                                         </div>
                                                         <div className={`px-3 py-1 rounded-full text-sm inline-block ${test.status === 'normal' ? 'bg-green-100 text-green-700' :
-                                                                test.status === 'high' ? 'bg-red-100 text-red-700' : 'bg-orange-100 text-orange-700'
+                                                            test.status === 'high' ? 'bg-red-100 text-red-700' : 'bg-orange-100 text-orange-700'
                                                             }`}>
                                                             {test.status === 'normal' ? 'Normal' : test.status === 'high' ? 'Above Range' : 'Below Range'}
                                                         </div>
@@ -1203,8 +1203,8 @@
                                     key={tab.id}
                                     onClick={() => setActiveTab(tab.id)}
                                     className={`flex-1 py-3 px-4 rounded-lg font-medium transition-all whitespace-nowrap ${activeTab === tab.id
-                                            ? 'bg-blue-600 text-white shadow-md'
-                                            : 'text-gray-600 hover:bg-gray-100'
+                                        ? 'bg-blue-600 text-white shadow-md'
+                                        : 'text-gray-600 hover:bg-gray-100'
                                         }`}
                                 >
                                     {tab.label}
