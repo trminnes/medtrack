@@ -527,6 +527,108 @@
                 }
             };
 
+            // Bottle Scanning function
+            const handleBottleScan = async (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+
+                try {
+                    alert('📸 Scanning bottle label...\n\nThis may take 10-20 seconds.');
+                    
+                    const result = await Tesseract.recognize(file, 'eng', {
+                        logger: m => {
+                            if (m.status === 'recognizing text') {
+                                console.log(`Progress: ${Math.round(m.progress * 100)}%`);
+                            }
+                        }
+                    });
+
+                    const text = result.data.text;
+                    console.log('Extracted text:', text);
+
+                    const medInfo = parseMedicationLabel(text);
+
+                    if (medInfo.name || medInfo.dosage) {
+                        setNewMed({
+                            ...newMed,
+                            name: medInfo.name || newMed.name,
+                            dosage: medInfo.dosage || newMed.dosage,
+                            prescriber: medInfo.prescriber || newMed.prescriber,
+                            pharmacy: medInfo.pharmacy || newMed.pharmacy,
+                            stockOnHand: medInfo.quantity || newMed.stockOnHand
+                        });
+                        alert('✅ Label scanned!\n\nPlease review and adjust the information as needed.');
+                    } else {
+                        alert('⚠️ Could not read label clearly.\n\nPlease enter information manually.');
+                    }
+                } catch (error) {
+                    console.error('Scan error:', error);
+                    alert('❌ Scanning failed. Please enter information manually.');
+                }
+                event.target.value = '';
+            };
+
+            const parseMedicationLabel = (text) => {
+                const info = { name: '', dosage: '', prescriber: '', pharmacy: '', quantity: 30 };
+                const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i].toUpperCase();
+                    if ((line.includes('RX') || line.includes('DRUG') || line.includes('MEDICATION')) && i + 1 < lines.length) {
+                        info.name = lines[i + 1];
+                    }
+                    const dosageMatch = lines[i].match(/(\d+\.?\d*)\s*(MG|ML|MCG|G|%|UNIT)/i);
+                    if (dosageMatch && !info.dosage) info.dosage = dosageMatch[0];
+                    if (line.includes('DR.') || line.includes('DR ') || line.includes('MD')) {
+                        info.prescriber = lines[i].replace(/PRESCRIBER:?/i, '').trim();
+                    }
+                    if (line.includes('PHARMACY') || line.includes('CVS') || line.includes('WALGREENS')) {
+                        info.pharmacy = lines[i];
+                    }
+                    const qtyMatch = lines[i].match(/(?:QTY|QUANTITY)[:\s]*(\d+)/i);
+                    if (qtyMatch) info.quantity = parseInt(qtyMatch[1]);
+                }
+                if (!info.name && lines.length > 0) {
+                    for (const line of lines) {
+                        if (line.length > 3 && !/pharmacy|rx#|dr\.|prescriber/i.test(line)) {
+                            info.name = line;
+                            break;
+                        }
+                    }
+                }
+                return info;
+            };
+
+            const exportToPDF = () => {
+                try {
+                    const userData = users[currentUser];
+                    const medications = userData?.medications || [];
+                    if (medications.length === 0) {
+                        alert('No medications to export.');
+                        return;
+                    }
+                    let htmlContent = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Medication List - ${userData.name}</title><style>body{font-family:Arial,sans-serif;margin:40px;color:#333}h1{color:#2563eb;border-bottom:3px solid #2563eb;padding-bottom:10px}.patient-info{background:#f3f4f6;padding:15px;border-radius:8px;margin:20px 0}.medication{border:1px solid #d1d5db;padding:15px;margin:15px 0;border-radius:8px;break-inside:avoid}.med-name{font-size:18px;font-weight:bold;color:#1f2937}.med-details{margin:10px 0;line-height:1.6}.label{font-weight:bold;color:#6b7280}.schedule{background:#e0e7ff;padding:5px 10px;border-radius:4px;display:inline-block;margin:2px}.footer{margin-top:40px;padding-top:20px;border-top:1px solid #d1d5db;color:#6b7280;font-size:12px}</style></head><body><h1>Medication List</h1><div class="patient-info"><p><span class="label">Patient Name:</span> ${userData.name}</p><p><span class="label">Date of Birth:</span> ${userData.dateOfBirth}</p><p><span class="label">Date Generated:</span> ${new Date().toLocaleDateString()}</p></div><h2>Current Medications (${medications.length})</h2>`;
+                    medications.forEach((med, index) => {
+                        const medType = med.dosageForm === 'vitamin' || med.dosageForm === 'supplement' ? `<span style="background:#10b981;color:white;padding:2px 8px;border-radius:4px;font-size:12px;">${med.dosageForm.toUpperCase()}</span>` : '';
+                        htmlContent += `<div class="medication"><div class="med-name">${index + 1}. ${med.name} ${medType}</div><div class="med-details"><p><span class="label">Dosage:</span> ${med.dosage} (${med.dosageForm})</p><p><span class="label">Schedule:</span> ${med.schedule.map(time => `<span class="schedule">${time}</span>`).join(' ')}</p><p><span class="label">Daily Doses:</span> ${med.dailyDose}</p><p><span class="label">Current Stock:</span> ${med.stockOnHand} doses</p>${med.prescriber ? `<p><span class="label">Prescriber:</span> ${med.prescriber}</p>` : ''}${med.pharmacy ? `<p><span class="label">Pharmacy:</span> ${med.pharmacy}</p>` : ''}${med.purpose ? `<p><span class="label">Purpose:</span> ${med.purpose}</p>` : ''}</div></div>`;
+                    });
+                    htmlContent += `<div class="footer"><p>Generated by MedTrack - Medication Management System</p><p>Please bring this list to your doctor appointments</p></div></body></html>`;
+                    const blob = new Blob([htmlContent], { type: 'text/html' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `medication-list-${userData.name.replace(/\s+/g, '-')}-${new Date().toISOString().split('T')[0]}.html`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    alert('✅ Medication list exported!\n\nOpen the downloaded file and print it to PDF or paper for your doctor.');
+                } catch (error) {
+                    console.error('Export error:', error);
+                    alert('❌ Export failed. Please try again.');
+                }
+            };
+
             // Parse lab results from text
             const parseLabResults = (text) => {
                 const tests = [];
@@ -1267,6 +1369,14 @@
                                         <span className="font-medium">Sync from GitHub</span>
                                     </button>
                                 )}
+                                
+                                <button
+                                    onClick={exportToPDF}
+                                    className="flex items-center gap-2 bg-gradient-to-r from-purple-600 to-pink-600 text-white px-4 py-2 rounded-lg shadow-md hover:shadow-lg transition-all"
+                                >
+                                    <Icon name="file" />
+                                    <span className="font-medium">Export for Doctor</span>
+                                </button>
                             </div>
                         </div>
 
@@ -1370,9 +1480,22 @@
                                 <div className="bg-white rounded-xl p-6 max-w-2xl w-full my-8">
                                     <div className="flex items-center justify-between mb-4">
                                         <h2 className="text-2xl font-bold text-gray-800">Add Medication</h2>
-                                        <button onClick={() => setShowAddMed(false)} className="text-gray-500 hover:text-gray-700">
-                                            <Icon name="x" />
-                                        </button>
+                                        <div className="flex items-center gap-2">
+                                            <label className="cursor-pointer flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors text-sm">
+                                                <Icon name="scan" className="w-4 h-4" />
+                                                <span>Scan Bottle</span>
+                                                <input
+                                                    type="file"
+                                                    accept="image/*"
+                                                    capture="environment"
+                                                    onChange={handleBottleScan}
+                                                    className="hidden"
+                                                />
+                                            </label>
+                                            <button onClick={() => setShowAddMed(false)} className="text-gray-500 hover:text-gray-700">
+                                                <Icon name="x" />
+                                            </button>
+                                        </div>
                                     </div>
                                     <div className="space-y-4 max-h-[70vh] overflow-y-auto pr-2">
                                         <div className="grid grid-cols-2 gap-4">
@@ -1410,6 +1533,9 @@
                                                     <option value="liquid">Liquid</option>
                                                     <option value="injection">Injection</option>
                                                     <option value="patch">Patch</option>
+                                                    <option value="vitamin">Vitamin</option>
+                                                    <option value="supplement">Supplement</option>
+                                                    <option value="other">Other</option>
                                                 </select>
                                             </div>
                                             <div>
