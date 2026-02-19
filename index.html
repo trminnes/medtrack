@@ -803,7 +803,7 @@
                 const medication = {
                     id: Date.now(),
                     ...newMed,
-                    lastRefillDate: new Date().toISOString().split('T')[0]
+                    lastRefillDate: getLocalDateString()
                 };
 
                 setUsers(prev => ({
@@ -999,7 +999,7 @@
             // Initialize today's log
             useEffect(() => {
                 if (!userData) return;
-                const today = new Date().toISOString().split('T')[0];
+                const today = getLocalDateString();
                 if (!todayLog[today]) {
                     const newLog = {};
                     medications.forEach(med => {
@@ -1017,12 +1017,20 @@
                 }
             }, [currentUser, medications]);
 
+            // Helper function to get local date string (avoids timezone issues)
+            const getLocalDateString = (date = new Date()) => {
+                const year = date.getFullYear();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const day = String(date.getDate()).padStart(2, '0');
+                return `${year}-${month}-${day}`;
+            };
+
             const getCurrentTime = () => {
                 return new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
             };
 
             const toggleMedication = (medId, time) => {
-                const today = new Date().toISOString().split('T')[0];
+                const today = getLocalDateString();
                 const key = `${medId}-${time}`;
                 const currentLog = todayLog[today] || {};
 
@@ -1092,7 +1100,7 @@
             };
 
             const getMedicationsForDay = (date) => {
-                const dateStr = date.toISOString().split('T')[0];
+                const dateStr = getLocalDateString(date);
                 const log = todayLog[dateStr] || {};
 
                 const taken = [];
@@ -1276,7 +1284,7 @@
 
             const TodayView = () => {
                 const viewDate = selectedDate || new Date();
-                const dateStr = viewDate.toISOString().split('T')[0];
+                const dateStr = getLocalDateString(viewDate);
                 const currentLog = todayLog[dateStr] || {};
                 const currentTime = getCurrentTime();
                 const isToday = viewDate.toDateString() === new Date().toDateString();
