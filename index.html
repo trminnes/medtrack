@@ -107,6 +107,10 @@
             const [newUserDOB, setNewUserDOB] = useState('');
             const [githubConnected, setGithubConnected] = useState(false);
             const [syncStatus, setSyncStatus] = useState('');
+            const [editingMed, setEditingMed] = useState(null);
+            const [showEditUser, setShowEditUser] = useState(false);
+            const [editUserName, setEditUserName] = useState('');
+            const [editUserDOB, setEditUserDOB] = useState('');
 
             // New medication form
             const [newMed, setNewMed] = useState({
@@ -344,12 +348,36 @@
                         '✅ SUCCESS!\n\n' +
                         'Connected to GitHub!\n\n' +
                         `Repository: ${fullRepo}\n\n` +
-                        'Your data will now sync automatically across all devices.\n\n' +
-                        'This token lasts 90+ days!'
+                        'Checking for existing data...'
                     );
                     
-                    // Initial sync
-                    setTimeout(() => syncToGitHub(), 1000);
+                    // Try to load existing data first
+                    try {
+                        const fileName = 'medtrack_data.json';
+                        const dataResponse = await fetch(`https://api.github.com/repos/${fullRepo}/contents/${fileName}`, {
+                            headers: {
+                                'Authorization': `token ${token}`,
+                                'Accept': 'application/vnd.github.v3+json'
+                            }
+                        });
+                        
+                        if (dataResponse.ok) {
+                            // Data exists in GitHub - load it
+                            const fileData = await dataResponse.json();
+                            const content = decodeURIComponent(escape(atob(fileData.content)));
+                            const data = JSON.parse(content);
+                            setUsers(data);
+                            alert('✅ Loaded existing data from GitHub!\n\nYour medications and data are now synced.');
+                        } else {
+                            // No data yet - upload current data
+                            alert('✅ No existing data found.\n\nYour current data will be uploaded to GitHub.');
+                            setTimeout(() => syncToGitHub(), 1000);
+                        }
+                    } catch (error) {
+                        console.error('Error checking for existing data:', error);
+                        // If error, just sync current data
+                        setTimeout(() => syncToGitHub(), 1000);
+                    }
                     
                 } catch (error) {
                     console.error('Setup error:', error);
@@ -570,32 +598,119 @@
 
             const parseMedicationLabel = (text) => {
                 const info = { name: '', dosage: '', prescriber: '', pharmacy: '', quantity: 30 };
-                const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-
+                
+                // Clean up OCR errors
+                text = text.replace(/[|]/g, 'I')  // Common OCR mistake
+                          .replace(/[0O]/g, (match) => match === '0' ? '0' : 'O')  // Context-aware
+                          .replace(/[1Il]/g, (match) => {
+                              // Try to determine from context
+                              return match;
+                          });
+                
+                const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+                
+                console.log('OCR Text Lines:', lines);
+                
+                // Try multiple strategies to find medication name
                 for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i].toUpperCase();
-                    if ((line.includes('RX') || line.includes('DRUG') || line.includes('MEDICATION')) && i + 1 < lines.length) {
-                        info.name = lines[i + 1];
+                    const line = lines[i];
+                    const upper = line.toUpperCase();
+                    
+                    // Strategy 1: Look for "DRUG NAME:" or "MEDICATION:" labels
+                    if (upper.includes('DRUG NAME') || upper.includes('MEDICATION NAME')) {
+                        if (i + 1 < lines.length) {
+                            info.name = lines[i + 1];
+                        } else {
+                            // Extract from same line
+                            const match = line.match(/(?:DRUG NAME|MEDICATION NAME)[:\s]+(.+)/i);
+                            if (match) info.name = match[1].trim();
+                        }
                     }
-                    const dosageMatch = lines[i].match(/(\d+\.?\d*)\s*(MG|ML|MCG|G|%|UNIT)/i);
-                    if (dosageMatch && !info.dosage) info.dosage = dosageMatch[0];
-                    if (line.includes('DR.') || line.includes('DR ') || line.includes('MD')) {
-                        info.prescriber = lines[i].replace(/PRESCRIBER:?/i, '').trim();
+                    
+                    // Strategy 2: Look for lines after RX# or Rx:
+                    if ((upper.includes('RX') || upper.includes('RX#')) && !upper.includes('REFILL')) {
+                        if (i + 1 < lines.length && !lines[i + 1].match(/\d{6,}/)) {
+                            // Next line is likely the med name (not an Rx number)
+                            info.name = lines[i + 1];
+                        }
                     }
-                    if (line.includes('PHARMACY') || line.includes('CVS') || line.includes('WALGREENS')) {
-                        info.pharmacy = lines[i];
+                    
+                    // Dosage - improved patterns
+                    const dosagePatterns = [
+                        /(\d+\.?\d*)\s*MG/i,
+                        /(\d+\.?\d*)\s*MCG/i,
+                        /(\d+\.?\d*)\s*ML/i,
+                        /(\d+\.?\d*)\s*UNIT/i,
+                        /(\d+\.?\d*)\s*IU/i,
+                        /(\d+\.?\d*)\s*%/,
+                        /(\d+\.?\d*)\s*G(?:\s|$)/i
+                    ];
+                    
+                    for (const pattern of dosagePatterns) {
+                        const match = line.match(pattern);
+                        if (match && !info.dosage) {
+                            info.dosage = match[0].trim();
+                            break;
+                        }
                     }
-                    const qtyMatch = lines[i].match(/(?:QTY|QUANTITY)[:\s]*(\d+)/i);
-                    if (qtyMatch) info.quantity = parseInt(qtyMatch[1]);
-                }
-                if (!info.name && lines.length > 0) {
-                    for (const line of lines) {
-                        if (line.length > 3 && !/pharmacy|rx#|dr\.|prescriber/i.test(line)) {
-                            info.name = line;
+                    
+                    // Prescriber - look for Dr. or MD
+                    if ((upper.includes('DR.') || upper.includes('DR ') || upper.includes(' MD') || upper.includes('PRESCRIBER')) && !info.prescriber) {
+                        let prescriberLine = line.replace(/PRESCRIBER:?/i, '').trim();
+                        // Clean up common patterns
+                        prescriberLine = prescriberLine.replace(/^(DR\.?|DOCTOR)\s*/i, '');
+                        if (prescriberLine.length > 2) {
+                            info.prescriber = prescriberLine;
+                        }
+                    }
+                    
+                    // Pharmacy
+                    const pharmacyKeywords = ['PHARMACY', 'CVS', 'WALGREENS', 'WALMART', 'PUBLIX', 'RITE AID', 'KROGER'];
+                    for (const keyword of pharmacyKeywords) {
+                        if (upper.includes(keyword)) {
+                            info.pharmacy = line;
+                            break;
+                        }
+                    }
+                    
+                    // Quantity
+                    const qtyPatterns = [
+                        /QTY[:\s]+(\d+)/i,
+                        /QUANTITY[:\s]+(\d+)/i,
+                        /QTY\s+(\d+)/i,
+                        /#\s*(\d+)\s*(?:TABS|CAPSULES|TABLETS)/i
+                    ];
+                    
+                    for (const pattern of qtyPatterns) {
+                        const match = line.match(pattern);
+                        if (match) {
+                            info.quantity = parseInt(match[1]);
                             break;
                         }
                     }
                 }
+                
+                // Fallback: If no name found, take the longest line that looks like a medication name
+                if (!info.name) {
+                    const candidates = lines.filter(line => {
+                        const upper = line.toUpperCase();
+                        return line.length >= 4 && 
+                               !upper.match(/PHARMACY|RX#|DR\.|PRESCRIBER|REFILL|DATE|TAKE|EXPIRES|PATIENT|PHONE/) &&
+                               !line.match(/^\d+$/) && // Not just numbers
+                               line.match(/[A-Z]/i); // Contains letters
+                    });
+                    
+                    if (candidates.length > 0) {
+                        // Take the first substantial candidate
+                        info.name = candidates[0];
+                    }
+                }
+                
+                // Clean up extracted info
+                if (info.name) info.name = info.name.replace(/[^\w\s-]/g, '').trim();
+                if (info.prescriber) info.prescriber = info.prescriber.replace(/[^\w\s.,-]/g, '').trim();
+                
+                console.log('Parsed medication info:', info);
                 return info;
             };
 
@@ -763,6 +878,122 @@
                 setShowAddUser(false);
                 setNewUserName('');
                 setNewUserDOB('');
+            };
+
+            // Edit medication
+            const startEditMed = (med) => {
+                setEditingMed(med);
+                setNewMed({
+                    name: med.name,
+                    dosage: med.dosage,
+                    dosageForm: med.dosageForm,
+                    schedule: med.schedule,
+                    stockOnHand: med.stockOnHand,
+                    dailyDose: med.dailyDose,
+                    prescriptionAmount: med.prescriptionAmount,
+                    prescriber: med.prescriber,
+                    pharmacy: med.pharmacy,
+                    purpose: med.purpose
+                });
+                setShowAddMed(true);
+            };
+
+            const handleUpdateMedication = () => {
+                if (!newMed.name || !newMed.dosage || !newMed.prescriber) {
+                    alert('Please fill in medication name, dosage, and prescriber');
+                    return;
+                }
+
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        medications: prev[currentUser].medications.map(med =>
+                            med.id === editingMed.id ? { ...editingMed, ...newMed } : med
+                        )
+                    }
+                }));
+
+                setShowAddMed(false);
+                setEditingMed(null);
+                setNewMed({
+                    name: '',
+                    dosage: '',
+                    dosageForm: 'tablet',
+                    schedule: ['08:00'],
+                    stockOnHand: 30,
+                    dailyDose: 1,
+                    prescriptionAmount: 30,
+                    prescriber: '',
+                    pharmacy: '',
+                    purpose: ''
+                });
+            };
+
+            // Delete medication
+            const deleteMedication = (medId, medName) => {
+                if (!confirm(`Are you sure you want to delete ${medName}?\n\nThis cannot be undone.`)) {
+                    return;
+                }
+
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        medications: prev[currentUser].medications.filter(med => med.id !== medId)
+                    }
+                }));
+            };
+
+            // Edit user
+            const startEditUser = () => {
+                const user = users[currentUser];
+                setEditUserName(user.name);
+                setEditUserDOB(user.dateOfBirth);
+                setShowEditUser(true);
+            };
+
+            const handleUpdateUser = () => {
+                if (!editUserName || !editUserDOB) {
+                    alert('Please fill in both name and date of birth');
+                    return;
+                }
+
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        name: editUserName,
+                        dateOfBirth: editUserDOB
+                    }
+                }));
+
+                setShowEditUser(false);
+                setEditUserName('');
+                setEditUserDOB('');
+            };
+
+            // Delete user
+            const deleteUser = (userId) => {
+                const user = users[userId];
+                if (!confirm(`⚠️ DELETE USER?\n\nAre you sure you want to delete ${user.name} and ALL associated data?\n\nThis includes:\n• ${user.medications?.length || 0} medications\n• ${user.bloodwork?.length || 0} bloodwork records\n• All medication logs\n\nThis CANNOT be undone!`)) {
+                    return;
+                }
+
+                const userKeys = Object.keys(users);
+                if (userKeys.length <= 1) {
+                    alert('Cannot delete the last user. At least one user must remain.');
+                    return;
+                }
+
+                const newUsers = { ...users };
+                delete newUsers[userId];
+
+                // Switch to first remaining user
+                const remainingUsers = Object.keys(newUsers);
+                setCurrentUser(remainingUsers[0]);
+                setUsers(newUsers);
+                setShowUserDropdown(false);
             };
 
             // Initialize today's log
@@ -984,19 +1215,47 @@
                     </button>
 
                     {showUserDropdown && (
-                        <div className="absolute top-full mt-2 left-0 bg-white rounded-lg shadow-xl border border-gray-200 z-50 min-w-[200px]">
+                        <div className="absolute top-full mt-2 left-0 bg-white rounded-lg shadow-xl border border-gray-200 z-50 min-w-[250px]">
                             {Object.entries(users).map(([userId, user]) => (
-                                <button
+                                <div
                                     key={userId}
-                                    onClick={() => {
-                                        setCurrentUser(userId);
-                                        setShowUserDropdown(false);
-                                    }}
-                                    className={`w-full text-left px-4 py-3 hover:bg-blue-50 transition-colors first:rounded-t-lg ${currentUser === userId ? 'bg-blue-100 font-semibold' : ''
-                                        }`}
+                                    className={`flex items-center justify-between px-4 py-3 hover:bg-blue-50 transition-colors first:rounded-t-lg ${currentUser === userId ? 'bg-blue-100' : ''}`}
                                 >
-                                    {user.name}
-                                </button>
+                                    <button
+                                        onClick={() => {
+                                            setCurrentUser(userId);
+                                            setShowUserDropdown(false);
+                                        }}
+                                        className={`flex-1 text-left ${currentUser === userId ? 'font-semibold' : ''}`}
+                                    >
+                                        {user.name}
+                                    </button>
+                                    {currentUser === userId && (
+                                        <div className="flex gap-1">
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    startEditUser();
+                                                    setShowUserDropdown(false);
+                                                }}
+                                                className="p-1 text-blue-600 hover:bg-blue-100 rounded"
+                                                title="Edit user"
+                                            >
+                                                ✏️
+                                            </button>
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    deleteUser(userId);
+                                                }}
+                                                className="p-1 text-red-600 hover:bg-red-100 rounded"
+                                                title="Delete user"
+                                            >
+                                                🗑️
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
                             ))}
                             <div className="border-t border-gray-200">
                                 <button
@@ -1064,12 +1323,28 @@
                                                 <p className="text-sm text-gray-500">{med.prescriber}</p>
                                             </div>
                                         </div>
-                                        {needsRefillSoon(med) && (
-                                            <div className="flex items-center gap-1 bg-orange-100 px-3 py-1 rounded-full">
-                                                <Icon name="alert" className="w-4 h-4 text-orange-600" />
-                                                <span className="text-sm text-orange-600 font-medium">Refill Soon</span>
-                                            </div>
-                                        )}
+                                        <div className="flex items-center gap-2">
+                                            {needsRefillSoon(med) && (
+                                                <div className="flex items-center gap-1 bg-orange-100 px-3 py-1 rounded-full">
+                                                    <Icon name="alert" className="w-4 h-4 text-orange-600" />
+                                                    <span className="text-sm text-orange-600 font-medium">Refill Soon</span>
+                                                </div>
+                                            )}
+                                            <button
+                                                onClick={() => startEditMed(med)}
+                                                className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                                                title="Edit medication"
+                                            >
+                                                ✏️
+                                            </button>
+                                            <button
+                                                onClick={() => deleteMedication(med.id, med.name)}
+                                                className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                                title="Delete medication"
+                                            >
+                                                🗑️
+                                            </button>
+                                        </div>
                                     </div>
 
                                     <div className="space-y-2">
@@ -1474,25 +1749,79 @@
                             </div>
                         )}
 
+                        {/* Edit User Modal */}
+                        {showEditUser && (
+                            <div className="fixed inset-0 bg-black bg-opacity-50 modal-overlay flex items-center justify-center z-50 p-4">
+                                <div className="bg-white rounded-xl p-6 max-w-md w-full">
+                                    <h2 className="text-2xl font-bold text-gray-800 mb-4">Edit User</h2>
+                                    <div className="space-y-4">
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Full Name</label>
+                                            <input
+                                                type="text"
+                                                value={editUserName}
+                                                onChange={(e) => setEditUserName(e.target.value)}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                                placeholder="John Doe"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Date of Birth</label>
+                                            <input
+                                                type="date"
+                                                value={editUserDOB}
+                                                onChange={(e) => setEditUserDOB(e.target.value)}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                            />
+                                        </div>
+                                        <div className="flex gap-3">
+                                            <button
+                                                onClick={handleUpdateUser}
+                                                disabled={!editUserName || !editUserDOB}
+                                                className="flex-1 bg-blue-600 text-white py-2 rounded-lg font-semibold hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                            >
+                                                Update User
+                                            </button>
+                                            <button
+                                                onClick={() => {
+                                                    setShowEditUser(false);
+                                                    setEditUserName('');
+                                                    setEditUserDOB('');
+                                                }}
+                                                className="flex-1 bg-gray-200 text-gray-800 py-2 rounded-lg font-semibold hover:bg-gray-300 transition-colors"
+                                            >
+                                                Cancel
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                         {/* Add Medication Modal */}
                         {showAddMed && (
                             <div className="fixed inset-0 bg-black bg-opacity-50 modal-overlay flex items-center justify-center z-50 p-4 overflow-y-auto">
                                 <div className="bg-white rounded-xl p-6 max-w-2xl w-full my-8">
                                     <div className="flex items-center justify-between mb-4">
-                                        <h2 className="text-2xl font-bold text-gray-800">Add Medication</h2>
+                                        <h2 className="text-2xl font-bold text-gray-800">{editingMed ? 'Edit Medication' : 'Add Medication'}</h2>
                                         <div className="flex items-center gap-2">
-                                            <label className="cursor-pointer flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors text-sm">
-                                                <Icon name="scan" className="w-4 h-4" />
-                                                <span>Scan Bottle</span>
-                                                <input
-                                                    type="file"
-                                                    accept="image/*"
-                                                    capture="environment"
-                                                    onChange={handleBottleScan}
-                                                    className="hidden"
-                                                />
-                                            </label>
-                                            <button onClick={() => setShowAddMed(false)} className="text-gray-500 hover:text-gray-700">
+                                            {!editingMed && (
+                                                <label className="cursor-pointer flex items-center gap-2 bg-blue-600 text-white px-3 py-2 rounded-lg hover:bg-blue-700 transition-colors text-sm">
+                                                    <Icon name="scan" className="w-4 h-4" />
+                                                    <span>Scan Bottle</span>
+                                                    <input
+                                                        type="file"
+                                                        accept="image/*"
+                                                        capture="environment"
+                                                        onChange={handleBottleScan}
+                                                        className="hidden"
+                                                    />
+                                                </label>
+                                            )}
+                                            <button onClick={() => {
+                                                setShowAddMed(false);
+                                                setEditingMed(null);
+                                            }} className="text-gray-500 hover:text-gray-700">
                                                 <Icon name="x" />
                                             </button>
                                         </div>
@@ -1641,13 +1970,16 @@
                                         </div>
                                         <div className="flex gap-3 pt-4">
                                             <button
-                                                onClick={handleAddMedication}
+                                                onClick={editingMed ? handleUpdateMedication : handleAddMedication}
                                                 className="flex-1 bg-blue-600 text-white py-2 rounded-lg font-semibold hover:bg-blue-700 transition-colors"
                                             >
-                                                Add Medication
+                                                {editingMed ? 'Update Medication' : 'Add Medication'}
                                             </button>
                                             <button
-                                                onClick={() => setShowAddMed(false)}
+                                                onClick={() => {
+                                                    setShowAddMed(false);
+                                                    setEditingMed(null);
+                                                }}
                                                 className="flex-1 bg-gray-200 text-gray-800 py-2 rounded-lg font-semibold hover:bg-gray-300 transition-colors"
                                             >
                                                 Cancel
