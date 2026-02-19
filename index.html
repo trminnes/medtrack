@@ -220,17 +220,21 @@
                 checkGitHubConnection();
             }, []);
 
-            // Save to localStorage
+            // Save to localStorage and sync with debounce
             useEffect(() => {
                 try {
                     localStorage.setItem(STORAGE_KEY, JSON.stringify(users));
                     if (githubConnected) {
-                        syncToGitHub();
+                        // Debounce sync to avoid conflicts
+                        const timeoutId = setTimeout(() => {
+                            syncToGitHub();
+                        }, 2000); // Wait 2 seconds before syncing
+                        return () => clearTimeout(timeoutId);
                     }
                 } catch (error) {
                     console.error('Error saving data:', error);
                 }
-            }, [users]);
+            }, [users, githubConnected]);
 
             // GitHub sync functions
             const connectGitHub = async () => {
@@ -474,8 +478,29 @@
                     if (response.ok) {
                         const fileData = await response.json();
                         const content = decodeURIComponent(escape(atob(fileData.content)));
-                        const data = JSON.parse(content);
-                        setUsers(data);
+                        const remoteData = JSON.parse(content);
+                        
+                        // Smart merge: keep all users from both local and remote
+                        setUsers(prev => {
+                            const merged = { ...remoteData };
+                            
+                            // Preserve any local users that might have been added recently
+                            Object.keys(prev).forEach(userId => {
+                                if (!merged[userId]) {
+                                    // Local user not in remote - keep it
+                                    merged[userId] = prev[userId];
+                                } else {
+                                    // User exists in both - use remote version (it's newer from sync)
+                                    // But preserve any very recent medication logs
+                                    const localLog = prev[userId].todayLog || {};
+                                    const remoteLog = merged[userId].todayLog || {};
+                                    merged[userId].todayLog = { ...remoteLog, ...localLog };
+                                }
+                            });
+                            
+                            return merged;
+                        });
+                        
                         setSyncStatus('Loaded from GitHub ✓');
                         setTimeout(() => setSyncStatus(''), 3000);
                     } else if (response.status === 401) {
@@ -861,7 +886,8 @@
             const addNewUser = () => {
                 if (!newUserName || !newUserDOB) return;
 
-                const newUserId = `user${Object.keys(users).length + 1}`;
+                // Use timestamp for unique ID across devices
+                const newUserId = `user_${Date.now()}`;
                 setUsers(prev => ({
                     ...prev,
                     [newUserId]: {
