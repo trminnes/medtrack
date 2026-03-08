@@ -111,6 +111,9 @@
             const [showEditUser, setShowEditUser] = useState(false);
             const [editUserName, setEditUserName] = useState('');
             const [editUserDOB, setEditUserDOB] = useState('');
+            const [showAddPRN, setShowAddPRN] = useState(false);
+            const [newPRN, setNewPRN] = useState({ name: '', dosage: '', dosageForm: 'tablet', reason: '', notes: '' });
+            const [showPRNLog, setShowPRNLog] = useState(false);
 
             // New medication form
             const [newMed, setNewMed] = useState({
@@ -184,6 +187,8 @@
             const medications = userData?.medications || [];
             const bloodwork = userData?.bloodwork || [];
             const todayLog = userData?.todayLog || {};
+            const prnMeds = userData?.prnMeds || [];
+            const prnLog = userData?.prnLog || [];
 
             // Check GitHub connection on load
             useEffect(() => {
@@ -971,6 +976,67 @@
                 }));
             };
 
+            // ── PRN (as-needed) medication functions ──────────────────────
+            const handleAddPRN = () => {
+                if (!newPRN.name || !newPRN.dosage) {
+                    alert('Please fill in medication name and dosage');
+                    return;
+                }
+                const prn = { id: Date.now(), ...newPRN };
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        prnMeds: [...(prev[currentUser].prnMeds || []), prn]
+                    }
+                }));
+                setShowAddPRN(false);
+                setNewPRN({ name: '', dosage: '', dosageForm: 'tablet', reason: '', notes: '' });
+            };
+
+            const deletePRN = (prnId, prnName) => {
+                if (!confirm(`Delete ${prnName} from as-needed list?\n\nThis will keep the usage history.`)) return;
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        prnMeds: (prev[currentUser].prnMeds || []).filter(p => p.id !== prnId)
+                    }
+                }));
+            };
+
+            const logPRNDose = (prnId) => {
+                const prn = prnMeds.find(p => p.id === prnId);
+                if (!prn) return;
+                const entry = {
+                    id: Date.now(),
+                    prnId,
+                    name: prn.name,
+                    dosage: prn.dosage,
+                    reason: prn.reason,
+                    takenAt: new Date().toISOString(),
+                    note: ''
+                };
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        prnLog: [...(prev[currentUser].prnLog || []), entry]
+                    }
+                }));
+                alert(`✓ Logged ${prn.name} ${prn.dosage} at ${to12Hour(new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }))}`);
+            };
+
+            const deletePRNLogEntry = (entryId) => {
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        prnLog: (prev[currentUser].prnLog || []).filter(e => e.id !== entryId)
+                    }
+                }));
+            };
+
             // Edit user
             const startEditUser = () => {
                 const user = users[currentUser];
@@ -1051,7 +1117,19 @@
                 return `${year}-${month}-${day}`;
             };
 
+            // Convert 24-hour "HH:MM" to 12-hour "h:MM AM/PM" for display
+            const to12Hour = (time24) => {
+                if (!time24) return time24;
+                const [hStr, mStr] = time24.split(':');
+                let h = parseInt(hStr, 10);
+                const m = mStr;
+                const ampm = h >= 12 ? 'PM' : 'AM';
+                h = h % 12 || 12;
+                return `${h}:${m} ${ampm}`;
+            };
+
             const getCurrentTime = () => {
+                // Returns 24-hour string for internal comparison (schedules stored as HH:MM)
                 return new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
             };
 
@@ -1344,91 +1422,96 @@
                                     Add Your First Medication
                                 </button>
                             </div>
-                        ) : (
-                            medications.map(med => (
-                                <div key={med.id} className="bg-white p-4 rounded-lg shadow-md border border-gray-200">
-                                    <div className="flex items-center justify-between mb-3">
-                                        <div className="flex items-center gap-3">
-                                            <div className="bg-blue-100 p-2 rounded-full">
-                                                <Icon name="pill" />
-                                            </div>
-                                            <div>
-                                                <h4 className="font-semibold text-gray-800">{med.name} <span className="text-blue-600">{med.dosage}</span></h4>
-                                                <p className="text-sm text-gray-500">{med.prescriber}</p>
-                                            </div>
-                                        </div>
-                                        <div className="flex items-center gap-2">
-                                            {needsRefillSoon(med) && (
-                                                <div className="flex items-center gap-1 bg-orange-100 px-3 py-1 rounded-full">
-                                                    <Icon name="alert" className="w-4 h-4 text-orange-600" />
-                                                    <span className="text-sm text-orange-600 font-medium">Refill Soon</span>
+                        ) : (() => {
+                            // Flatten all dose slots across all meds, sort by time
+                            const allSlots = [];
+                            medications.forEach(med => {
+                                med.schedule.forEach(time => {
+                                    allSlots.push({ med, time });
+                                });
+                            });
+                            allSlots.sort((a, b) => a.time.localeCompare(b.time));
+
+                            // Group consecutive slots belonging to same med for visual grouping, but render in time order
+                            return allSlots.map(({ med, time }) => {
+                                const key = `${med.id}-${time}`;
+                                const isTaken = currentLog[key];
+                                const isPast = isToday && time < currentTime;
+
+                                return (
+                                    <div key={key} className="bg-white p-4 rounded-lg shadow-md border border-gray-200">
+                                        <div className="flex items-center justify-between mb-3">
+                                            <div className="flex items-center gap-3">
+                                                <div className="bg-blue-100 p-2 rounded-full">
+                                                    <Icon name="pill" />
                                                 </div>
-                                            )}
-                                            <button
-                                                onClick={() => startEditMed(med)}
-                                                className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                                                title="Edit medication"
-                                            >
-                                                ✏️
-                                            </button>
-                                            <button
-                                                onClick={() => deleteMedication(med.id, med.name)}
-                                                className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                                                title="Delete medication"
-                                            >
-                                                🗑️
-                                            </button>
-                                        </div>
-                                    </div>
-
-                                    <div className="space-y-2">
-                                        {med.schedule.map(time => {
-                                            const key = `${med.id}-${time}`;
-                                            const isTaken = currentLog[key];
-                                            const isPast = isToday && time < currentTime;
-
-                                            return (
-                                                <div
-                                                    key={time}
-                                                    className={`flex items-center justify-between p-3 rounded-lg border-2 transition-all ${isTaken
-                                                            ? 'bg-green-50 border-green-300'
-                                                            : isPast
-                                                                ? 'bg-red-50 border-red-300'
-                                                                : 'bg-gray-50 border-gray-300 hover:border-blue-400'
-                                                        }`}
-                                                >
-                                                    <div className="flex items-center gap-3">
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={isTaken}
-                                                            onChange={() => toggleMedication(med.id, time)}
-                                                            disabled={!isToday}
-                                                            className="w-6 h-6 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer disabled:cursor-not-allowed"
-                                                        />
-                                                        <div>
-                                                            <p className="font-medium text-gray-800">{time} - {med.dosage}</p>
-                                                            <p className="text-sm text-gray-500">
-                                                                {isTaken ? 'Taken' : isPast ? 'Missed' : 'Scheduled'}
-                                                            </p>
-                                                        </div>
+                                                <div>
+                                                    <h4 className="font-semibold text-gray-800">{med.name} <span className="text-blue-600">{med.dosage}</span></h4>
+                                                    <p className="text-sm text-gray-500">{med.prescriber}</p>
+                                                </div>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                {needsRefillSoon(med) && (
+                                                    <div className="flex items-center gap-1 bg-orange-100 px-3 py-1 rounded-full">
+                                                        <Icon name="alert" className="w-4 h-4 text-orange-600" />
+                                                        <span className="text-sm text-orange-600 font-medium">Refill Soon</span>
                                                     </div>
-                                                    {isTaken && <Icon name="check" className="w-6 h-6 text-green-600" />}
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
+                                                )}
+                                                <button
+                                                    onClick={() => startEditMed(med)}
+                                                    className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                                                    title="Edit medication"
+                                                >
+                                                    ✏️
+                                                </button>
+                                                <button
+                                                    onClick={() => deleteMedication(med.id, med.name)}
+                                                    className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                                    title="Delete medication"
+                                                >
+                                                    🗑️
+                                                </button>
+                                            </div>
+                                        </div>
 
-                                    <div className="mt-3 pt-3 border-t border-gray-200">
-                                        <div className="flex justify-between text-sm">
-                                            <span className="text-gray-600">Stock on hand:</span>
-                                            <span className={`font-semibold ${needsRefillSoon(med) ? 'text-orange-600' : 'text-gray-800'}`}>
-                                                {med.stockOnHand} {med.dosageForm}s ({getDaysUntilRefill(med)} days)
-                                            </span>
+                                        <div
+                                            className={`flex items-center justify-between p-3 rounded-lg border-2 transition-all ${isTaken
+                                                    ? 'bg-green-50 border-green-300'
+                                                    : isPast
+                                                        ? 'bg-red-50 border-red-300'
+                                                        : 'bg-gray-50 border-gray-300 hover:border-blue-400'
+                                                }`}
+                                        >
+                                            <div className="flex items-center gap-3">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isTaken}
+                                                    onChange={() => toggleMedication(med.id, time)}
+                                                    disabled={!isToday}
+                                                    className="w-6 h-6 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer disabled:cursor-not-allowed"
+                                                />
+                                                <div>
+                                                    <p className="font-medium text-gray-800">{to12Hour(time)} — {med.dosage}</p>
+                                                    <p className="text-sm text-gray-500">
+                                                        {isTaken ? '✓ Taken' : isPast ? '⚠ Missed' : 'Scheduled'}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            {isTaken && <Icon name="check" className="w-6 h-6 text-green-600" />}
+                                        </div>
+
+                                        <div className="mt-3 pt-3 border-t border-gray-200">
+                                            <div className="flex justify-between text-sm">
+                                                <span className="text-gray-600">Stock on hand:</span>
+                                                <span className={`font-semibold ${needsRefillSoon(med) ? 'text-orange-600' : 'text-gray-800'}`}>
+                                                    {med.stockOnHand} {med.dosageForm}s ({getDaysUntilRefill(med)} days)
+                                                </span>
+                                            </div>
                                         </div>
                                     </div>
-                                </div>
-                            ))
-                        )}
+                                );
+                            });
+                        })()}
                     </div>
                 );
             };
@@ -1500,9 +1583,9 @@
                                     <div className="mb-4">
                                         <p className="text-sm text-gray-500 mb-2">Schedule</p>
                                         <div className="flex flex-wrap gap-2">
-                                            {med.schedule.map(time => (
+                                            {[...med.schedule].sort().map(time => (
                                                 <span key={time} className="bg-blue-100 text-blue-700 px-3 py-1 rounded-full text-sm font-medium">
-                                                    {time} - {med.dosage}
+                                                    {to12Hour(time)} — {med.dosage}
                                                 </span>
                                             ))}
                                         </div>
@@ -1638,6 +1721,142 @@
                 </div>
             );
 
+            // ── PRN (As-Needed) View ──────────────────────────────────────
+            const PRNView = () => {
+                const [expandedLog, setExpandedLog] = React.useState(false);
+
+                const logByDate = {};
+                [...prnLog].sort((a,b) => new Date(b.takenAt) - new Date(a.takenAt)).forEach(entry => {
+                    const d = entry.takenAt ? new Date(entry.takenAt).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) : 'Unknown date';
+                    if (!logByDate[d]) logByDate[d] = [];
+                    logByDate[d].push(entry);
+                });
+
+                return (
+                    <div className="space-y-4">
+                        <div className="bg-white rounded-xl shadow-md border border-gray-200 overflow-hidden">
+                            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-amber-50 to-orange-50">
+                                <div>
+                                    <h3 className="font-bold text-gray-800 text-lg">💊 As-Needed Medications</h3>
+                                    <p className="text-xs text-gray-500 mt-0.5">Non-scheduled · Log each use to keep a record</p>
+                                </div>
+                                <button
+                                    onClick={() => setShowAddPRN(true)}
+                                    className="flex items-center gap-2 bg-amber-500 text-white px-4 py-2 rounded-lg hover:bg-amber-600 transition-colors text-sm font-medium"
+                                >
+                                    <Icon name="plus" className="w-4 h-4" />
+                                    Add
+                                </button>
+                            </div>
+
+                            {prnMeds.length === 0 ? (
+                                <div className="p-8 text-center">
+                                    <div className="text-4xl mb-3">💊</div>
+                                    <p className="text-gray-500 font-medium">No as-needed medications yet</p>
+                                    <p className="text-sm text-gray-400 mt-1">Add OTC or PRN meds like pain relievers, antacids, allergy medicine, etc.</p>
+                                    <button
+                                        onClick={() => setShowAddPRN(true)}
+                                        className="mt-4 bg-amber-500 text-white px-5 py-2 rounded-lg hover:bg-amber-600 transition-colors text-sm font-medium"
+                                    >
+                                        Add First As-Needed Med
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="divide-y divide-gray-100">
+                                    {prnMeds.map(prn => {
+                                        const todayCount = prnLog.filter(e => {
+                                            if (e.prnId !== prn.id) return false;
+                                            return new Date(e.takenAt).toDateString() === new Date().toDateString();
+                                        }).length;
+                                        const totalCount = prnLog.filter(e => e.prnId === prn.id).length;
+                                        return (
+                                            <div key={prn.id} className="px-5 py-4">
+                                                <div className="flex items-start justify-between">
+                                                    <div className="flex-1">
+                                                        <div className="flex items-center gap-2 flex-wrap">
+                                                            <span className="font-semibold text-gray-800">{prn.name}</span>
+                                                            <span className="text-amber-600 font-medium">{prn.dosage}</span>
+                                                            <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{prn.dosageForm}</span>
+                                                        </div>
+                                                        {prn.reason && <p className="text-sm text-gray-500 mt-1">Used for: {prn.reason}</p>}
+                                                        {prn.notes && <p className="text-xs text-gray-400 mt-0.5">{prn.notes}</p>}
+                                                        <div className="flex gap-3 mt-2 text-xs text-gray-500">
+                                                            <span>Today: <strong className={todayCount > 0 ? 'text-amber-600' : 'text-gray-600'}>{todayCount}x</strong></span>
+                                                            <span>All time: <strong>{totalCount}x</strong></span>
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 ml-3">
+                                                        <button
+                                                            onClick={() => logPRNDose(prn.id)}
+                                                            className="bg-amber-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium hover:bg-amber-600 transition-colors whitespace-nowrap"
+                                                        >
+                                                            Log Dose
+                                                        </button>
+                                                        <button
+                                                            onClick={() => deletePRN(prn.id, prn.name)}
+                                                            className="p-1.5 text-red-400 hover:bg-red-50 rounded-lg transition-colors"
+                                                            title="Remove from list"
+                                                        >
+                                                            🗑️
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="bg-white rounded-xl shadow-md border border-gray-200 overflow-hidden">
+                            <button
+                                onClick={() => setExpandedLog(!expandedLog)}
+                                className="w-full flex items-center justify-between px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-slate-50 to-gray-50 hover:bg-gray-50 transition-colors"
+                            >
+                                <div>
+                                    <h3 className="font-bold text-gray-800 text-lg text-left">📋 Usage History</h3>
+                                    <p className="text-xs text-gray-500 mt-0.5 text-left">{prnLog.length} total doses logged</p>
+                                </div>
+                                <Icon name={expandedLog ? "chevronUp" : "chevronDown"} />
+                            </button>
+
+                            {expandedLog && (
+                                <div className="max-h-96 overflow-y-auto">
+                                    {prnLog.length === 0 ? (
+                                        <p className="text-center text-gray-400 text-sm py-8">No doses logged yet.</p>
+                                    ) : (
+                                        Object.entries(logByDate).map(([date, entries]) => (
+                                            <div key={date}>
+                                                <div className="px-5 py-2 bg-gray-50 border-b border-gray-100">
+                                                    <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">{date}</span>
+                                                </div>
+                                                {entries.map(entry => (
+                                                    <div key={entry.id} className="flex items-center justify-between px-5 py-3 border-b border-gray-50 hover:bg-gray-50">
+                                                        <div>
+                                                            <span className="font-medium text-gray-800">{entry.name}</span>
+                                                            <span className="text-amber-600 ml-2 text-sm">{entry.dosage}</span>
+                                                            <span className="text-gray-400 ml-2 text-sm">
+                                                                {entry.takenAt ? new Date(entry.takenAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }) : ''}
+                                                            </span>
+                                                            {entry.reason && <p className="text-xs text-gray-400 mt-0.5">For: {entry.reason}</p>}
+                                                        </div>
+                                                        <button
+                                                            onClick={() => deletePRNLogEntry(entry.id)}
+                                                            className="text-xs text-red-400 hover:text-red-600 ml-3 flex-shrink-0"
+                                                            title="Delete entry"
+                                                        >✕</button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                );
+            };
+
             return (
                 <div className="min-h-screen bg-gradient-to-br from-blue-50 via-white to-purple-50 p-4">
                     <div className="max-w-4xl mx-auto">
@@ -1710,6 +1929,7 @@
                             {[
                                 { id: 'today', label: "Today's Doses" },
                                 { id: 'medications', label: 'Medications' },
+                                { id: 'asneeded', label: 'As-Needed' },
                                 { id: 'bloodwork', label: 'Bloodwork' },
                                 { id: 'calendar', label: 'Calendar' }
                             ].map(tab => (
@@ -1730,6 +1950,7 @@
                         <div>
                             {activeTab === 'today' && <TodayView />}
                             {activeTab === 'medications' && <MedicationsView />}
+                            {activeTab === 'asneeded' && <PRNView />}
                             {activeTab === 'bloodwork' && <BloodworkView />}
                             {activeTab === 'calendar' && <CalendarView />}
                         </div>
@@ -2144,6 +2365,93 @@
                                 </div>
                             </div>
                         )}
+                        {/* Add As-Needed Medication Modal */}
+                        {showAddPRN && (
+                            <div className="fixed inset-0 bg-black bg-opacity-50 modal-overlay flex items-center justify-center z-50 p-4">
+                                <div className="bg-white rounded-xl p-6 max-w-md w-full">
+                                    <div className="flex items-center justify-between mb-4">
+                                        <h2 className="text-2xl font-bold text-gray-800">Add As-Needed Med</h2>
+                                        <button onClick={() => setShowAddPRN(false)} className="text-gray-500 hover:text-gray-700">
+                                            <Icon name="x" />
+                                        </button>
+                                    </div>
+                                    <p className="text-sm text-gray-500 mb-4">For non-scheduled medications taken only when needed (OTC pain relievers, antacids, allergy meds, etc.)</p>
+                                    <div className="space-y-4">
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-700 mb-1">Medication Name *</label>
+                                                <input
+                                                    type="text"
+                                                    value={newPRN.name}
+                                                    onChange={(e) => setNewPRN({ ...newPRN, name: e.target.value })}
+                                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500"
+                                                    placeholder="e.g., Ibuprofen"
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-700 mb-1">Dosage *</label>
+                                                <input
+                                                    type="text"
+                                                    value={newPRN.dosage}
+                                                    onChange={(e) => setNewPRN({ ...newPRN, dosage: e.target.value })}
+                                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500"
+                                                    placeholder="e.g., 400mg"
+                                                />
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Form</label>
+                                            <select
+                                                value={newPRN.dosageForm}
+                                                onChange={(e) => setNewPRN({ ...newPRN, dosageForm: e.target.value })}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500"
+                                            >
+                                                <option value="tablet">Tablet</option>
+                                                <option value="capsule">Capsule</option>
+                                                <option value="liquid">Liquid</option>
+                                                <option value="patch">Patch</option>
+                                                <option value="other">Other</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Used for (reason)</label>
+                                            <input
+                                                type="text"
+                                                value={newPRN.reason}
+                                                onChange={(e) => setNewPRN({ ...newPRN, reason: e.target.value })}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500"
+                                                placeholder="e.g., headache, back pain, heartburn"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Notes (optional)</label>
+                                            <textarea
+                                                value={newPRN.notes}
+                                                onChange={(e) => setNewPRN({ ...newPRN, notes: e.target.value })}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-amber-500"
+                                                rows="2"
+                                                placeholder="Max dose per day, when to take, etc."
+                                            />
+                                        </div>
+                                        <div className="flex gap-3 pt-2">
+                                            <button
+                                                onClick={handleAddPRN}
+                                                className="flex-1 bg-amber-500 text-white py-2 rounded-lg font-semibold hover:bg-amber-600 transition-colors"
+                                            >
+                                                Add Medication
+                                            </button>
+                                            <button
+                                                onClick={() => { setShowAddPRN(false); setNewPRN({ name: '', dosage: '', dosageForm: 'tablet', reason: '', notes: '' }); }}
+                                                className="flex-1 bg-gray-200 text-gray-800 py-2 rounded-lg font-semibold hover:bg-gray-300 transition-colors"
+                                            >
+                                                Cancel
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                     </div>
                 </div>
             );
