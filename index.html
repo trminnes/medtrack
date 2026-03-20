@@ -114,6 +114,10 @@
             const [showAddPRN, setShowAddPRN] = useState(false);
             const [newPRN, setNewPRN] = useState({ name: '', dosage: '', dosageForm: 'tablet', reason: '', notes: '' });
             const [showPRNLog, setShowPRNLog] = useState(false);
+            // Late-dose time picker state
+            const [showActualTimeModal, setShowActualTimeModal] = useState(false);
+            const [actualTimePending, setActualTimePending] = useState(null); // { medId, scheduledTime }
+            const [actualTimeInput, setActualTimeInput] = useState('');
 
             // New medication form
             const [newMed, setNewMed] = useState({
@@ -534,33 +538,38 @@
 
                 setUploadingPDF(true);
                 try {
-                    // Convert PDF to images
                     const arrayBuffer = await file.arrayBuffer();
                     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
                     let extractedText = '';
 
-                    // Extract text from each page
+                    // First try native PDF text extraction (fast, accurate for digital PDFs like MyChart)
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
-                        const viewport = page.getViewport({ scale: 2.0 });
-
-                        // Create canvas
-                        const canvas = document.createElement('canvas');
-                        const context = canvas.getContext('2d');
-                        canvas.height = viewport.height;
-                        canvas.width = viewport.width;
-
-                        // Render PDF page to canvas
-                        await page.render({ canvasContext: context, viewport: viewport }).promise;
-
-                        // OCR the canvas
-                        const result = await Tesseract.recognize(canvas, 'eng', {
-                            logger: m => console.log(m)
-                        });
-
-                        extractedText += result.data.text + '\n';
+                        const textContent = await page.getTextContent();
+                        const pageText = textContent.items.map(item => item.str).join('\n');
+                        extractedText += pageText + '\n';
                     }
+
+                    // If native extraction yielded very little text, fall back to OCR
+                    if (extractedText.replace(/\s/g, '').length < 100) {
+                        extractedText = '';
+                        for (let i = 1; i <= pdf.numPages; i++) {
+                            const page = await pdf.getPage(i);
+                            const viewport = page.getViewport({ scale: 2.0 });
+                            const canvas = document.createElement('canvas');
+                            const context = canvas.getContext('2d');
+                            canvas.height = viewport.height;
+                            canvas.width = viewport.width;
+                            await page.render({ canvasContext: context, viewport: viewport }).promise;
+                            const result = await Tesseract.recognize(canvas, 'eng', {
+                                logger: m => console.log(m)
+                            });
+                            extractedText += result.data.text + '\n';
+                        }
+                    }
+
+                    console.log('Extracted PDF text:', extractedText);
 
                     // Parse the extracted text for lab values
                     const parsedTests = parseLabResults(extractedText);
@@ -777,32 +786,159 @@
             // Parse lab results from text
             const parseLabResults = (text) => {
                 const tests = [];
-                const lines = text.split('\n');
+                const seen = new Set();
 
-                // Common lab test patterns
-                const patterns = [
-                    { name: 'HbA1c', regex: /HbA1c.*?(\d+\.?\d*)\s*%/i, unit: '%', normalRange: '4.0-5.6' },
-                    { name: 'Glucose', regex: /glucose.*?(\d+)\s*mg/i, unit: 'mg/dL', normalRange: '70-100' },
-                    { name: 'Total Cholesterol', regex: /cholesterol.*?(\d+)\s*mg/i, unit: 'mg/dL', normalRange: '<200' },
-                    { name: 'HDL', regex: /HDL.*?(\d+)\s*mg/i, unit: 'mg/dL', normalRange: '>40' },
-                    { name: 'LDL', regex: /LDL.*?(\d+)\s*mg/i, unit: 'mg/dL', normalRange: '<100' },
-                    { name: 'Triglycerides', regex: /triglycerides.*?(\d+)\s*mg/i, unit: 'mg/dL', normalRange: '<150' },
-                    { name: 'TSH', regex: /TSH.*?(\d+\.?\d*)\s*mIU/i, unit: 'mIU/L', normalRange: '0.4-4.0' },
-                ];
+                // ── Strategy 1: MyChart / structured PDF format ──────────────────
+                // The PDF emits lines like:
+                //   "Sodium"
+                //   "Normal value: 136 - 145 mmol/L"
+                //   "Value"
+                //   "134"
+                //   "Low"          ← optional flag
+                // We walk the lines looking for a known test name, then grab the
+                // normal range and the value that follows "Value".
+                const knownTests = {
+                    'sodium':               { unit: 'mmol/L' },
+                    'potassium':            { unit: 'mmol/L' },
+                    'chloride':             { unit: 'mmol/L' },
+                    'co2':                  { unit: 'mmol/L' },
+                    'carbon dioxide':       { unit: 'mmol/L' },
+                    'glucose':              { unit: 'mg/dL' },
+                    'creatinine':           { unit: 'mg/dL' },
+                    'bun':                  { unit: 'mg/dL' },
+                    'bun, bld':             { unit: 'mg/dL' },
+                    'blood urea nitrogen':  { unit: 'mg/dL' },
+                    'gfr estimate ckd-epi': { unit: 'mL/min/1.73m²' },
+                    'egfr':                 { unit: 'mL/min/1.73m²' },
+                    'total protein':        { unit: 'g/dL' },
+                    'albumin':              { unit: 'g/dL' },
+                    'calcium':              { unit: 'mg/dL' },
+                    'total bilirubin':      { unit: 'mg/dL' },
+                    'bilirubin':            { unit: 'mg/dL' },
+                    'alkaline phosphatase': { unit: 'U/L' },
+                    'ast':                  { unit: 'U/L' },
+                    'alt':                  { unit: 'U/L' },
+                    'alt (sgpt)':           { unit: 'U/L' },
+                    'hba1c':                { unit: '%' },
+                    'hemoglobin a1c':       { unit: '%' },
+                    'total cholesterol':    { unit: 'mg/dL' },
+                    'cholesterol':          { unit: 'mg/dL' },
+                    'hdl':                  { unit: 'mg/dL' },
+                    'ldl':                  { unit: 'mg/dL' },
+                    'triglycerides':        { unit: 'mg/dL' },
+                    'tsh':                  { unit: 'mIU/L' },
+                    'wbc':                  { unit: 'K/uL' },
+                    'rbc':                  { unit: 'M/uL' },
+                    'hemoglobin':           { unit: 'g/dL' },
+                    'hematocrit':           { unit: '%' },
+                    'platelets':            { unit: 'K/uL' },
+                    'mcv':                  { unit: 'fL' },
+                    'mch':                  { unit: 'pg' },
+                    'mchc':                 { unit: 'g/dL' },
+                    'rdw':                  { unit: '%' },
+                    'neutrophils':          { unit: '%' },
+                    'lymphocytes':          { unit: '%' },
+                    'monocytes':            { unit: '%' },
+                    'eosinophils':          { unit: '%' },
+                    'basophils':            { unit: '%' },
+                    'uric acid':            { unit: 'mg/dL' },
+                    'magnesium':            { unit: 'mg/dL' },
+                    'phosphorus':           { unit: 'mg/dL' },
+                    'iron':                 { unit: 'ug/dL' },
+                    'ferritin':             { unit: 'ng/mL' },
+                    'vitamin d':            { unit: 'ng/mL' },
+                    'vitamin b12':          { unit: 'pg/mL' },
+                    'folate':               { unit: 'ng/mL' },
+                    'psa':                  { unit: 'ng/mL' },
+                    'free t4':              { unit: 'ng/dL' },
+                    'free t3':              { unit: 'pg/mL' },
+                };
 
-                patterns.forEach(pattern => {
-                    const match = text.match(pattern.regex);
-                    if (match) {
-                        const value = parseFloat(match[1]);
+                const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+                for (let i = 0; i < lines.length; i++) {
+                    const lineLower = lines[i].toLowerCase();
+                    const matched = Object.keys(knownTests).find(k => lineLower === k || lineLower.startsWith(k));
+                    if (!matched || seen.has(matched)) continue;
+
+                    // Look ahead for "Normal value: X - Y unit" or "Normal value: >=X"
+                    let normalRange = null;
+                    let unit = knownTests[matched].unit;
+                    let value = null;
+
+                    for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
+                        // Parse normal range line  e.g. "Normal value: 136 - 145 mmol/L"
+                        const rangeMatch = lines[j].match(/normal value[:\s]+([\d.<>=\s\-]+(?:mmol\/L|mg\/dL|g\/dL|U\/L|%|mIU\/L|ng\/mL|pg\/mL|ng\/dL|pg\/dL|ug\/dL|K\/uL|M\/uL|fL|pg|mL\/min[^\s]*)?)/i);
+                        if (rangeMatch) {
+                            normalRange = rangeMatch[1].trim()
+                                .replace(/\s*mmol\/L\s*/i, '').replace(/\s*mg\/dL\s*/i, '')
+                                .replace(/\s*g\/dL\s*/i, '').replace(/\s*U\/L\s*/i, '')
+                                .replace(/\s*mIU\/L\s*/i, '').replace(/\s*ng\/mL\s*/i, '')
+                                .replace(/\s*pg\/mL\s*/i, '').replace(/\s*K\/uL\s*/i, '')
+                                .replace(/\s*%\s*/i, '').replace(/\s*fL\s*/i, '')
+                                .replace(/\s*pg\s*/i, '').replace(/\s*mL\/min.*$/i, '')
+                                .replace(/\s+/g, ' ').trim();
+                            // normalize "136 - 145" → "136-145"
+                            normalRange = normalRange.replace(/\s*-\s*/g, '-');
+                            continue;
+                        }
+                        // After "Value" label, the next non-flag line is the numeric value
+                        if (lines[j].toLowerCase() === 'value') {
+                            if (j + 1 < lines.length) {
+                                const candidate = lines[j + 1].trim();
+                                if (/^\d+\.?\d*$/.test(candidate)) {
+                                    value = parseFloat(candidate);
+                                }
+                            }
+                            break;
+                        }
+                    }
+
+                    if (value !== null && normalRange) {
+                        const displayName = lines[i]; // use original casing from PDF
+                        seen.add(matched);
                         tests.push({
-                            name: pattern.name,
-                            value: value,
-                            unit: pattern.unit,
-                            normalRange: pattern.normalRange,
-                            status: determineStatus(value, pattern.normalRange)
+                            name: displayName,
+                            value,
+                            unit,
+                            normalRange,
+                            status: determineStatus(value, normalRange)
                         });
                     }
-                });
+                }
+
+                // ── Strategy 2: Inline regex patterns (legacy / other report formats) ──
+                if (tests.length === 0) {
+                    const inlinePatterns = [
+                        { name: 'HbA1c',            regex: /HbA1c.*?(\d+\.?\d*)\s*%/i,           unit: '%',      normalRange: '4.0-5.6' },
+                        { name: 'Glucose',           regex: /glucose.*?(\d+)\s*mg/i,              unit: 'mg/dL',  normalRange: '70-99' },
+                        { name: 'Total Cholesterol', regex: /cholesterol.*?(\d+)\s*mg/i,          unit: 'mg/dL',  normalRange: '<200' },
+                        { name: 'HDL',               regex: /HDL.*?(\d+)\s*mg/i,                 unit: 'mg/dL',  normalRange: '>40' },
+                        { name: 'LDL',               regex: /LDL.*?(\d+)\s*mg/i,                 unit: 'mg/dL',  normalRange: '<100' },
+                        { name: 'Triglycerides',     regex: /triglycerides.*?(\d+)\s*mg/i,        unit: 'mg/dL',  normalRange: '<150' },
+                        { name: 'TSH',               regex: /TSH.*?(\d+\.?\d*)\s*mIU/i,          unit: 'mIU/L',  normalRange: '0.4-4.0' },
+                        { name: 'Sodium',            regex: /sodium.*?(\d+)\s*mmol/i,             unit: 'mmol/L', normalRange: '136-145' },
+                        { name: 'Potassium',         regex: /potassium.*?(\d+\.?\d*)\s*mmol/i,    unit: 'mmol/L', normalRange: '3.5-5.1' },
+                        { name: 'Creatinine',        regex: /creatinine.*?(\d+\.?\d*)\s*mg/i,     unit: 'mg/dL',  normalRange: '0.70-1.20' },
+                        { name: 'BUN',               regex: /\bBUN\b.*?(\d+)\s*mg/i,             unit: 'mg/dL',  normalRange: '6-23' },
+                        { name: 'Calcium',           regex: /calcium.*?(\d+\.?\d*)\s*mg/i,        unit: 'mg/dL',  normalRange: '7.6-10.4' },
+                        { name: 'ALT',               regex: /\bALT\b.*?(\d+)\s*U/i,              unit: 'U/L',    normalRange: '10-50' },
+                        { name: 'AST',               regex: /\bAST\b.*?(\d+)\s*U/i,              unit: 'U/L',    normalRange: '10-50' },
+                    ];
+                    inlinePatterns.forEach(pattern => {
+                        const match = text.match(pattern.regex);
+                        if (match) {
+                            const value = parseFloat(match[1]);
+                            tests.push({
+                                name: pattern.name,
+                                value,
+                                unit: pattern.unit,
+                                normalRange: pattern.normalRange,
+                                status: determineStatus(value, pattern.normalRange)
+                            });
+                        }
+                    });
+                }
 
                 return tests;
             };
@@ -1133,34 +1269,150 @@
                 return new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
             };
 
-            const toggleMedication = (medId, time) => {
+            // ── Core function: mark a dose taken with an actual time ─────────
+            const markDoseTaken = (medId, scheduledTime, actualTime) => {
                 const today = getLocalDateString();
-                const key = `${medId}-${time}`;
+                const key = `${medId}-${scheduledTime}`;
                 const currentLog = todayLog[today] || {};
 
-                const newLog = {
-                    ...todayLog,
-                    [today]: {
-                        ...currentLog,
-                        [key]: !currentLog[key]
-                    }
+                // Build updated log — store actual time alongside the boolean
+                const todayEntry = {
+                    ...currentLog,
+                    [key]: true,
+                    [`${key}-actual`]: actualTime  // e.g. "10:00"
                 };
 
-                let updatedMedications = medications;
-                if (!currentLog[key]) {
-                    updatedMedications = medications.map(med =>
-                        med.id === medId ? { ...med, stockOnHand: med.stockOnHand - 1 } : med
-                    );
+                // If the actual time is later than scheduled, recalculate remaining
+                // doses for this med today based on the new anchor time
+                const med = medications.find(m => m.id === medId);
+                let rescheduledTimes = null;
+                if (med && actualTime > scheduledTime) {
+                    rescheduledTimes = recalcRemainingDoses(med, scheduledTime, actualTime, today, todayEntry);
+                    if (rescheduledTimes) {
+                        // Merge rescheduled slot keys into today's log
+                        Object.assign(todayEntry, rescheduledTimes.logPatch);
+                    }
                 }
+
+                const newLog = { ...todayLog, [today]: todayEntry };
+
+                const updatedMedications = medications.map(m =>
+                    m.id === medId ? { ...m, stockOnHand: m.stockOnHand - 1 } : m
+                );
 
                 setUsers(prev => ({
                     ...prev,
                     [currentUser]: {
                         ...prev[currentUser],
                         todayLog: newLog,
-                        medications: updatedMedications
+                        medications: updatedMedications,
+                        // Store today's overridden schedule so TodayView can display it
+                        dailyOverrides: {
+                            ...(prev[currentUser].dailyOverrides || {}),
+                            [today]: {
+                                ...(prev[currentUser].dailyOverrides?.[today] || {}),
+                                ...(rescheduledTimes ? { [medId]: rescheduledTimes.newTimes } : {})
+                            }
+                        }
                     }
                 }));
+            };
+
+            // ── Recalculate remaining doses for a med after a late take ────────
+            // Returns { newTimes: string[], logPatch: object } or null
+            const recalcRemainingDoses = (med, takenScheduledTime, actualTime, today, existingLog) => {
+                // Determine interval by looking at gaps between scheduled times
+                const sorted = [...med.schedule].sort();
+                if (sorted.length < 2) return null; // single daily dose — nothing to shift
+
+                // Find the average interval in minutes between doses
+                const toMins = t => { const [h,m] = t.split(':').map(Number); return h*60+m; };
+                const fromMins = mins => {
+                    const h = Math.floor(mins/60) % 24;
+                    const m = mins % 60;
+                    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+                };
+
+                const intervals = [];
+                for (let i = 1; i < sorted.length; i++) {
+                    intervals.push(toMins(sorted[i]) - toMins(sorted[i-1]));
+                }
+                const avgInterval = Math.round(intervals.reduce((a,b)=>a+b,0) / intervals.length);
+
+                // Find which scheduled times are AFTER the one just taken and not yet marked
+                const takenIdx = sorted.indexOf(takenScheduledTime);
+                const remaining = sorted.slice(takenIdx + 1).filter(t => {
+                    const k = `${med.id}-${t}`;
+                    return !existingLog[k]; // not already taken
+                });
+                if (remaining.length === 0) return null;
+
+                // Build new times starting from actualTime + interval
+                const newTimes = [];
+                let anchor = toMins(actualTime);
+                remaining.forEach(() => {
+                    anchor += avgInterval;
+                    if (anchor < 24*60) newTimes.push(fromMins(anchor));
+                });
+
+                // Build log patch: remove old slot keys, add override markers
+                const logPatch = {};
+                remaining.forEach((oldTime, i) => {
+                    // Mark old slot as overridden (not a missed dose)
+                    logPatch[`${med.id}-${oldTime}-overridden`] = newTimes[i] || null;
+                });
+
+                return { newTimes, logPatch };
+            };
+
+            // ── Unmark a dose (checkbox un-tick) ──────────────────────────────
+            const unmarkDoseTaken = (medId, scheduledTime) => {
+                const today = getLocalDateString();
+                const key = `${medId}-${scheduledTime}`;
+                const currentLog = todayLog[today] || {};
+
+                // Remove the taken flag and actual time
+                const todayEntry = { ...currentLog };
+                delete todayEntry[key];
+                delete todayEntry[`${key}-actual`];
+
+                // Restore stock
+                const updatedMedications = medications.map(m =>
+                    m.id === medId ? { ...m, stockOnHand: m.stockOnHand + 1 } : m
+                );
+
+                // Remove daily override for this med so schedule reverts
+                const existingOverrides = users[currentUser]?.dailyOverrides?.[today] || {};
+                const newOverrides = { ...existingOverrides };
+                delete newOverrides[medId];
+
+                setUsers(prev => ({
+                    ...prev,
+                    [currentUser]: {
+                        ...prev[currentUser],
+                        todayLog: { ...todayLog, [today]: todayEntry },
+                        medications: updatedMedications,
+                        dailyOverrides: {
+                            ...(prev[currentUser].dailyOverrides || {}),
+                            [today]: newOverrides
+                        }
+                    }
+                }));
+            };
+
+            // ── Checkbox handler: open actual-time modal when checking ─────────
+            const toggleMedication = (medId, time, isCurrentlyTaken) => {
+                if (isCurrentlyTaken) {
+                    unmarkDoseTaken(medId, time);
+                } else {
+                    // Pre-fill with current time
+                    const now = new Date();
+                    const hh = String(now.getHours()).padStart(2,'0');
+                    const mm = String(now.getMinutes()).padStart(2,'0');
+                    setActualTimeInput(`${hh}:${mm}`);
+                    setActualTimePending({ medId, scheduledTime: time });
+                    setShowActualTimeModal(true);
+                }
             };
 
             const getDaysUntilRefill = (med) => {
@@ -1423,20 +1675,49 @@
                                 </button>
                             </div>
                         ) : (() => {
-                            // Flatten all dose slots across all meds, sort by time
+                            // Get any daily overrides for today (recalculated times after a late dose)
+                            const dailyOverrides = isToday
+                                ? (users[currentUser]?.dailyOverrides?.[dateStr] || {})
+                                : {};
+
+                            // Build the effective schedule for each med:
+                            // taken scheduled slots + override times for not-yet-taken slots
                             const allSlots = [];
                             medications.forEach(med => {
-                                med.schedule.forEach(time => {
-                                    allSlots.push({ med, time });
+                                const overrideTimes = dailyOverrides[med.id]; // string[] | undefined
+                                const sorted = [...med.schedule].sort();
+
+                                sorted.forEach((scheduledTime, idx) => {
+                                    const key = `${med.id}-${scheduledTime}`;
+                                    const isTaken     = !!currentLog[key];
+                                    const isOverridden = !!currentLog[`${key}-overridden`];
+                                    const actualTime  = currentLog[`${key}-actual`];
+
+                                    if (isOverridden && !isTaken) {
+                                        // This slot was pushed to a new time — show rescheduled card
+                                        // Find which override index this was
+                                        const takenScheduled = sorted.filter(t => !!currentLog[`${med.id}-${t}`]);
+                                        const lastTakenIdx = takenScheduled.length > 0
+                                            ? sorted.indexOf(takenScheduled[takenScheduled.length - 1])
+                                            : -1;
+                                        const overrideIdx = idx - lastTakenIdx - 1;
+                                        const newTime = overrideTimes?.[overrideIdx];
+                                        allSlots.push({ med, scheduledTime, displayTime: newTime || scheduledTime,
+                                            isRescheduled: true, isTaken: false, actualTime: null });
+                                    } else {
+                                        allSlots.push({ med, scheduledTime, displayTime: scheduledTime,
+                                            isRescheduled: false, isTaken, actualTime });
+                                    }
                                 });
                             });
-                            allSlots.sort((a, b) => a.time.localeCompare(b.time));
 
-                            // Group consecutive slots belonging to same med for visual grouping, but render in time order
-                            return allSlots.map(({ med, time }) => {
-                                const key = `${med.id}-${time}`;
-                                const isTaken = currentLog[key];
-                                const isPast = isToday && time < currentTime;
+                            // Sort by display time
+                            allSlots.sort((a, b) => a.displayTime.localeCompare(b.displayTime));
+
+                            return allSlots.map(({ med, scheduledTime, displayTime, isRescheduled, isTaken, actualTime }) => {
+                                const key = `${med.id}-${scheduledTime}`;
+                                const isPast = isToday && displayTime < currentTime && !isTaken;
+                                const wasLate = isTaken && actualTime && actualTime !== scheduledTime;
 
                                 return (
                                     <div key={key} className="bg-white p-4 rounded-lg shadow-md border border-gray-200">
@@ -1457,43 +1738,53 @@
                                                         <span className="text-sm text-orange-600 font-medium">Refill Soon</span>
                                                     </div>
                                                 )}
+                                                {isRescheduled && (
+                                                    <div className="flex items-center gap-1 bg-amber-100 px-2 py-1 rounded-full">
+                                                        <span className="text-xs text-amber-700 font-medium">⏱ Rescheduled</span>
+                                                    </div>
+                                                )}
                                                 <button
                                                     onClick={() => startEditMed(med)}
                                                     className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
                                                     title="Edit medication"
-                                                >
-                                                    ✏️
-                                                </button>
+                                                >✏️</button>
                                                 <button
                                                     onClick={() => deleteMedication(med.id, med.name)}
                                                     className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
                                                     title="Delete medication"
-                                                >
-                                                    🗑️
-                                                </button>
+                                                >🗑️</button>
                                             </div>
                                         </div>
 
-                                        <div
-                                            className={`flex items-center justify-between p-3 rounded-lg border-2 transition-all ${isTaken
-                                                    ? 'bg-green-50 border-green-300'
-                                                    : isPast
-                                                        ? 'bg-red-50 border-red-300'
-                                                        : 'bg-gray-50 border-gray-300 hover:border-blue-400'
-                                                }`}
-                                        >
+                                        <div className={`flex items-center justify-between p-3 rounded-lg border-2 transition-all ${
+                                            isTaken   ? 'bg-green-50 border-green-300' :
+                                            isPast    ? 'bg-red-50 border-red-300' :
+                                            isRescheduled ? 'bg-amber-50 border-amber-300' :
+                                            'bg-gray-50 border-gray-300 hover:border-blue-400'
+                                        }`}>
                                             <div className="flex items-center gap-3">
                                                 <input
                                                     type="checkbox"
                                                     checked={isTaken}
-                                                    onChange={() => toggleMedication(med.id, time)}
+                                                    onChange={() => toggleMedication(med.id, scheduledTime, isTaken)}
                                                     disabled={!isToday}
                                                     className="w-6 h-6 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer disabled:cursor-not-allowed"
                                                 />
                                                 <div>
-                                                    <p className="font-medium text-gray-800">{to12Hour(time)} — {med.dosage}</p>
+                                                    <p className="font-medium text-gray-800">
+                                                        {isRescheduled
+                                                            ? <span>{to12Hour(displayTime)} <span className="text-xs text-amber-600 font-normal">(was {to12Hour(scheduledTime)})</span></span>
+                                                            : to12Hour(displayTime)
+                                                        } — {med.dosage}
+                                                    </p>
                                                     <p className="text-sm text-gray-500">
-                                                        {isTaken ? '✓ Taken' : isPast ? '⚠ Missed' : 'Scheduled'}
+                                                        {isTaken
+                                                            ? wasLate
+                                                                ? <span className="text-amber-700">✓ Taken at {to12Hour(actualTime)} <span className="text-gray-400">(scheduled {to12Hour(scheduledTime)})</span></span>
+                                                                : `✓ Taken at ${to12Hour(actualTime || scheduledTime)}`
+                                                            : isPast ? '⚠ Missed'
+                                                            : isRescheduled ? 'Rescheduled due to late dose'
+                                                            : 'Scheduled'}
                                                     </p>
                                                 </div>
                                             </div>
@@ -2365,6 +2656,101 @@
                                 </div>
                             </div>
                         )}
+                        {/* Actual Time Taken Modal */}
+                        {showActualTimeModal && actualTimePending && (
+                            <div className="fixed inset-0 bg-black bg-opacity-50 modal-overlay flex items-center justify-center z-50 p-4">
+                                <div className="bg-white rounded-xl p-6 max-w-sm w-full">
+                                    <div className="flex items-center gap-3 mb-4">
+                                        <div className="bg-blue-100 p-2 rounded-full">
+                                            <Icon name="clock" className="w-6 h-6 text-blue-600" />
+                                        </div>
+                                        <div>
+                                            <h2 className="text-xl font-bold text-gray-800">Record Actual Time</h2>
+                                            <p className="text-sm text-gray-500">
+                                                {(() => {
+                                                    const med = medications.find(m => m.id === actualTimePending.medId);
+                                                    return med ? `${med.name} ${med.dosage}` : '';
+                                                })()}
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-blue-50 rounded-lg p-3 mb-4 text-sm text-blue-800">
+                                        <p><span className="font-semibold">Scheduled:</span> {to12Hour(actualTimePending.scheduledTime)}</p>
+                                        {actualTimeInput !== actualTimePending.scheduledTime && (
+                                            <p className="mt-1 text-amber-700">
+                                                <span className="font-semibold">⏱ Late by:</span> {(() => {
+                                                    const toMins = t => { const [h,m] = t.split(':').map(Number); return h*60+m; };
+                                                    const diff = toMins(actualTimeInput) - toMins(actualTimePending.scheduledTime);
+                                                    if (diff <= 0) return 'on time';
+                                                    const h = Math.floor(diff/60), m = diff%60;
+                                                    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+                                                })()}
+                                            </p>
+                                        )}
+                                    </div>
+
+                                    <div className="mb-4">
+                                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                                            Actual time taken
+                                        </label>
+                                        <input
+                                            type="time"
+                                            value={actualTimeInput}
+                                            onChange={e => setActualTimeInput(e.target.value)}
+                                            className="w-full px-4 py-3 text-lg border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                        />
+                                    </div>
+
+                                    {actualTimeInput > actualTimePending.scheduledTime && (() => {
+                                        const med = medications.find(m => m.id === actualTimePending.medId);
+                                        if (!med || med.schedule.length < 2) return null;
+                                        const sorted = [...med.schedule].sort();
+                                        const takenIdx = sorted.indexOf(actualTimePending.scheduledTime);
+                                        const remaining = sorted.slice(takenIdx + 1);
+                                        if (remaining.length === 0) return null;
+                                        return (
+                                            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm">
+                                                <p className="font-semibold text-amber-800 mb-1">⏱ Today's remaining doses will be rescheduled:</p>
+                                                <p className="text-amber-700 text-xs">
+                                                    {remaining.length} remaining dose{remaining.length > 1 ? 's' : ''} will shift forward to maintain your {(() => {
+                                                        const toMins = t => { const [h,m] = t.split(':').map(Number); return h*60+m; };
+                                                        const intervals = [];
+                                                        for (let i = 1; i < sorted.length; i++) intervals.push(toMins(sorted[i]) - toMins(sorted[i-1]));
+                                                        const avg = Math.round(intervals.reduce((a,b)=>a+b,0)/intervals.length);
+                                                        return avg >= 60 ? `${Math.round(avg/60)}-hour` : `${avg}-minute`;
+                                                    })()} interval. Tomorrow reverts to normal schedule.
+                                                </p>
+                                            </div>
+                                        );
+                                    })()}
+
+                                    <div className="flex gap-3">
+                                        <button
+                                            onClick={() => {
+                                                if (!actualTimeInput) return;
+                                                markDoseTaken(actualTimePending.medId, actualTimePending.scheduledTime, actualTimeInput);
+                                                setShowActualTimeModal(false);
+                                                setActualTimePending(null);
+                                            }}
+                                            className="flex-1 bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 transition-colors"
+                                        >
+                                            ✓ Confirm Taken
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setShowActualTimeModal(false);
+                                                setActualTimePending(null);
+                                            }}
+                                            className="flex-1 bg-gray-200 text-gray-800 py-3 rounded-lg font-semibold hover:bg-gray-300 transition-colors"
+                                        >
+                                            Cancel
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                         {/* Add As-Needed Medication Modal */}
                         {showAddPRN && (
                             <div className="fixed inset-0 bg-black bg-opacity-50 modal-overlay flex items-center justify-center z-50 p-4">
