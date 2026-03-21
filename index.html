@@ -102,6 +102,7 @@
             const [showAddUser, setShowAddUser] = useState(false);
             const [showAddMed, setShowAddMed] = useState(false);
             const [showAddBloodwork, setShowAddBloodwork] = useState(false);
+            const [editingBloodwork, setEditingBloodwork] = useState(null); // holds bloodwork entry being edited
             const [uploadingPDF, setUploadingPDF] = useState(false);
             const [newUserName, setNewUserName] = useState('');
             const [newUserDOB, setNewUserDOB] = useState('');
@@ -531,63 +532,87 @@
                 }
             };
 
-            // PDF Scanning function
+            // PDF Scanning function — supports multiple files at once
+            const extractTextFromPDF = async (file) => {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                let text = '';
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    text += textContent.items.map(item => item.str).join('\n') + '\n';
+                }
+                // Fall back to OCR if native extraction yielded very little text
+                if (text.replace(/\s/g, '').length < 100) {
+                    text = '';
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const viewport = page.getViewport({ scale: 2.0 });
+                        const canvas = document.createElement('canvas');
+                        canvas.height = viewport.height;
+                        canvas.width = viewport.width;
+                        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+                        const result = await Tesseract.recognize(canvas, 'eng', { logger: m => console.log(m) });
+                        text += result.data.text + '\n';
+                    }
+                }
+                return text;
+            };
+
+            const extractDateFromText = (text) => {
+                const datePatterns = [
+                    /collected\s+on\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})/i,
+                    /collection\s+date[:\s]+([A-Za-z]+\s+\d{1,2},\s+\d{4})/i,
+                    /specimen\s+collected[:\s]+([A-Za-z]+\s+\d{1,2},\s+\d{4})/i,
+                    /date\s+collected[:\s]+([A-Za-z]+\s+\d{1,2},\s+\d{4})/i,
+                    /collected[:\s]+(\d{1,2}\/\d{1,2}\/\d{4})/i,
+                    /collection\s+date[:\s]+(\d{1,2}\/\d{1,2}\/\d{4})/i,
+                    /([A-Za-z]{3}\s+\d{1,2},\s+\d{4})\s+\d{1,2}:\d{2}/,
+                ];
+                for (const pat of datePatterns) {
+                    const m = text.match(pat);
+                    if (m) {
+                        const parsed = new Date(m[1]);
+                        if (!isNaN(parsed.getTime())) {
+                            const y = parsed.getFullYear();
+                            const mo = String(parsed.getMonth() + 1).padStart(2, '0');
+                            const d = String(parsed.getDate()).padStart(2, '0');
+                            return `${y}-${mo}-${d}`;
+                        }
+                    }
+                }
+                return getLocalDateString();
+            };
+
             const handlePDFUpload = async (event) => {
-                const file = event.target.files[0];
-                if (!file) return;
+                const files = Array.from(event.target.files);
+                if (!files.length) return;
 
                 setUploadingPDF(true);
                 try {
-                    const arrayBuffer = await file.arrayBuffer();
-                    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                    let combinedText = '';
+                    let collectionDate = null;
 
-                    let extractedText = '';
-
-                    // First try native PDF text extraction (fast, accurate for digital PDFs like MyChart)
-                    for (let i = 1; i <= pdf.numPages; i++) {
-                        const page = await pdf.getPage(i);
-                        const textContent = await page.getTextContent();
-                        const pageText = textContent.items.map(item => item.str).join('\n');
-                        extractedText += pageText + '\n';
+                    for (const file of files) {
+                        const text = await extractTextFromPDF(file);
+                        combinedText += text + '\n';
+                        // Use the date from the first file that has one
+                        if (!collectionDate) collectionDate = extractDateFromText(text);
                     }
 
-                    // If native extraction yielded very little text, fall back to OCR
-                    if (extractedText.replace(/\s/g, '').length < 100) {
-                        extractedText = '';
-                        for (let i = 1; i <= pdf.numPages; i++) {
-                            const page = await pdf.getPage(i);
-                            const viewport = page.getViewport({ scale: 2.0 });
-                            const canvas = document.createElement('canvas');
-                            const context = canvas.getContext('2d');
-                            canvas.height = viewport.height;
-                            canvas.width = viewport.width;
-                            await page.render({ canvasContext: context, viewport: viewport }).promise;
-                            const result = await Tesseract.recognize(canvas, 'eng', {
-                                logger: m => console.log(m)
-                            });
-                            extractedText += result.data.text + '\n';
-                        }
-                    }
-
-                    console.log('Extracted PDF text:', extractedText);
-
-                    // Parse the extracted text for lab values
-                    const parsedTests = parseLabResults(extractedText);
+                    console.log('Combined PDF text from', files.length, 'file(s):', combinedText);
+                    const parsedTests = parseLabResults(combinedText);
 
                     if (parsedTests.length > 0) {
-                        setNewBloodwork({
-                            date: new Date().toISOString().split('T')[0],
-                            tests: parsedTests
-                        });
+                        setNewBloodwork({ date: collectionDate || getLocalDateString(), tests: parsedTests });
                         setShowAddBloodwork(true);
                     } else {
-                        alert('Could not extract lab results. Please enter manually.');
+                        alert('Could not extract lab results from the selected files. Please enter manually.');
                         setShowAddBloodwork(true);
                     }
-
                 } catch (error) {
                     console.error('PDF processing error:', error);
-                    alert('Error processing PDF. Please try again or enter data manually.');
+                    alert('Error processing PDF(s). Please try again or enter data manually.');
                 } finally {
                     setUploadingPDF(false);
                     event.target.value = '';
@@ -797,61 +822,69 @@
                 //   "Low"          ← optional flag
                 // We walk the lines looking for a known test name, then grab the
                 // normal range and the value that follows "Value".
+                // Keys are lowercase; matching is case-insensitive so all-caps MyChart headers (e.g. "PSA SCREENING", "VITAMIN D 25HYDROXY") match correctly
                 const knownTests = {
-                    'sodium':               { unit: 'mmol/L' },
-                    'potassium':            { unit: 'mmol/L' },
-                    'chloride':             { unit: 'mmol/L' },
-                    'co2':                  { unit: 'mmol/L' },
-                    'carbon dioxide':       { unit: 'mmol/L' },
-                    'glucose':              { unit: 'mg/dL' },
-                    'creatinine':           { unit: 'mg/dL' },
-                    'bun':                  { unit: 'mg/dL' },
-                    'bun, bld':             { unit: 'mg/dL' },
-                    'blood urea nitrogen':  { unit: 'mg/dL' },
-                    'gfr estimate ckd-epi': { unit: 'mL/min/1.73m²' },
-                    'egfr':                 { unit: 'mL/min/1.73m²' },
-                    'total protein':        { unit: 'g/dL' },
-                    'albumin':              { unit: 'g/dL' },
-                    'calcium':              { unit: 'mg/dL' },
-                    'total bilirubin':      { unit: 'mg/dL' },
-                    'bilirubin':            { unit: 'mg/dL' },
-                    'alkaline phosphatase': { unit: 'U/L' },
-                    'ast':                  { unit: 'U/L' },
-                    'alt':                  { unit: 'U/L' },
-                    'alt (sgpt)':           { unit: 'U/L' },
-                    'hba1c':                { unit: '%' },
-                    'hemoglobin a1c':       { unit: '%' },
-                    'total cholesterol':    { unit: 'mg/dL' },
-                    'cholesterol':          { unit: 'mg/dL' },
-                    'hdl':                  { unit: 'mg/dL' },
-                    'ldl':                  { unit: 'mg/dL' },
-                    'triglycerides':        { unit: 'mg/dL' },
-                    'tsh':                  { unit: 'mIU/L' },
-                    'wbc':                  { unit: 'K/uL' },
-                    'rbc':                  { unit: 'M/uL' },
-                    'hemoglobin':           { unit: 'g/dL' },
-                    'hematocrit':           { unit: '%' },
-                    'platelets':            { unit: 'K/uL' },
-                    'mcv':                  { unit: 'fL' },
-                    'mch':                  { unit: 'pg' },
-                    'mchc':                 { unit: 'g/dL' },
-                    'rdw':                  { unit: '%' },
-                    'neutrophils':          { unit: '%' },
-                    'lymphocytes':          { unit: '%' },
-                    'monocytes':            { unit: '%' },
-                    'eosinophils':          { unit: '%' },
-                    'basophils':            { unit: '%' },
-                    'uric acid':            { unit: 'mg/dL' },
-                    'magnesium':            { unit: 'mg/dL' },
-                    'phosphorus':           { unit: 'mg/dL' },
-                    'iron':                 { unit: 'ug/dL' },
-                    'ferritin':             { unit: 'ng/mL' },
-                    'vitamin d':            { unit: 'ng/mL' },
-                    'vitamin b12':          { unit: 'pg/mL' },
-                    'folate':               { unit: 'ng/mL' },
-                    'psa':                  { unit: 'ng/mL' },
-                    'free t4':              { unit: 'ng/dL' },
-                    'free t3':              { unit: 'pg/mL' },
+                    'sodium':                { unit: 'mmol/L' },
+                    'potassium':             { unit: 'mmol/L' },
+                    'chloride':              { unit: 'mmol/L' },
+                    'co2':                   { unit: 'mmol/L' },
+                    'carbon dioxide':        { unit: 'mmol/L' },
+                    'glucose':               { unit: 'mg/dL' },
+                    'creatinine':            { unit: 'mg/dL' },
+                    'bun':                   { unit: 'mg/dL' },
+                    'bun, bld':              { unit: 'mg/dL' },
+                    'blood urea nitrogen':   { unit: 'mg/dL' },
+                    'gfr estimate ckd-epi':  { unit: 'mL/min/1.73m²' },
+                    'egfr':                  { unit: 'mL/min/1.73m²' },
+                    'total protein':         { unit: 'g/dL' },
+                    'albumin':               { unit: 'g/dL' },
+                    'calcium':               { unit: 'mg/dL' },
+                    'total bilirubin':       { unit: 'mg/dL' },
+                    'bilirubin':             { unit: 'mg/dL' },
+                    'alkaline phosphatase':  { unit: 'U/L' },
+                    'ast':                   { unit: 'U/L' },
+                    'alt':                   { unit: 'U/L' },
+                    'alt (sgpt)':            { unit: 'U/L' },
+                    'hba1c':                 { unit: '%' },
+                    'hemoglobin a1c':        { unit: '%', displayName: 'HbA1c' },
+                    'a1c':                   { unit: '%', displayName: 'HbA1c' },
+                    'total cholesterol':     { unit: 'mg/dL' },
+                    'cholesterol':           { unit: 'mg/dL' },
+                    'hdl':                   { unit: 'mg/dL' },
+                    'ldl':                   { unit: 'mg/dL' },
+                    'triglycerides':         { unit: 'mg/dL' },
+                    'tsh':                   { unit: 'mIU/L' },
+                    'wbc':                   { unit: 'K/uL' },
+                    'rbc':                   { unit: 'M/uL' },
+                    'hemoglobin':            { unit: 'g/dL' },
+                    'hematocrit':            { unit: '%' },
+                    'platelets':             { unit: 'K/uL' },
+                    'mcv':                   { unit: 'fL' },
+                    'mch':                   { unit: 'pg' },
+                    'mchc':                  { unit: 'g/dL' },
+                    'rdw':                   { unit: '%' },
+                    'neutrophils':           { unit: '%' },
+                    'lymphocytes':           { unit: '%' },
+                    'monocytes':             { unit: '%' },
+                    'eosinophils':           { unit: '%' },
+                    'basophils':             { unit: '%' },
+                    'uric acid':             { unit: 'mg/dL' },
+                    'magnesium':             { unit: 'mg/dL' },
+                    'phosphorus':            { unit: 'mg/dL' },
+                    'iron':                  { unit: 'ug/dL' },
+                    'ferritin':              { unit: 'ng/mL' },
+                    'vitamin d':             { unit: 'ng/mL', displayName: 'Vitamin D' },
+                    'vitamin b12':           { unit: 'pg/mL', displayName: 'Vitamin B12' },
+                    'folate':                { unit: 'ng/mL' },
+                    'psa':                   { unit: 'ng/mL', displayName: 'PSA' },
+                    'free t4':               { unit: 'ng/dL', displayName: 'Free T4' },
+                    'free t3':               { unit: 'pg/mL', displayName: 'Free T3' },
+                    'testosterone':          { unit: 'ng/dL' },
+                    'free testosterone':     { unit: 'pg/mL', displayName: 'Free Testosterone' },
+                    'cortisol':              { unit: 'ug/dL' },
+                    'c-reactive protein':    { unit: 'mg/L', displayName: 'C-Reactive Protein' },
+                    'crp':                   { unit: 'mg/L' },
+                    'esr':                   { unit: 'mm/hr' },
                 };
 
                 const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
@@ -866,7 +899,7 @@
                     let unit = knownTests[matched].unit;
                     let value = null;
 
-                    for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
+                    for (let j = i + 1; j < Math.min(i + 20, lines.length); j++) {
                         // Parse normal range line  e.g. "Normal value: 136 - 145 mmol/L"
                         const rangeMatch = lines[j].match(/normal value[:\s]+([\d.<>=\s\-]+(?:mmol\/L|mg\/dL|g\/dL|U\/L|%|mIU\/L|ng\/mL|pg\/mL|ng\/dL|pg\/dL|ug\/dL|K\/uL|M\/uL|fL|pg|mL\/min[^\s]*)?)/i);
                         if (rangeMatch) {
@@ -895,7 +928,7 @@
                     }
 
                     if (value !== null && normalRange) {
-                        const displayName = lines[i]; // use original casing from PDF
+                        const displayName = knownTests[matched].displayName || lines[i]; // prefer friendly name, fall back to PDF text
                         seen.add(matched);
                         tests.push({
                             name: displayName,
@@ -995,32 +1028,59 @@
                 });
             };
 
-            // Add bloodwork
+            // Add or update bloodwork
             const handleAddBloodwork = () => {
                 if (newBloodwork.tests.length === 0) {
                     alert('Please add at least one test result');
                     return;
                 }
+                if (editingBloodwork) {
+                    // Update existing entry
+                    setUsers(prev => ({
+                        ...prev,
+                        [currentUser]: {
+                            ...prev[currentUser],
+                            bloodwork: prev[currentUser].bloodwork.map(b =>
+                                b.id === editingBloodwork.id
+                                    ? { ...b, date: newBloodwork.date, tests: newBloodwork.tests }
+                                    : b
+                            )
+                        }
+                    }));
+                } else {
+                    // Add new entry
+                    setUsers(prev => ({
+                        ...prev,
+                        [currentUser]: {
+                            ...prev[currentUser],
+                            bloodwork: [...prev[currentUser].bloodwork, {
+                                id: Date.now(),
+                                date: newBloodwork.date,
+                                tests: newBloodwork.tests
+                            }]
+                        }
+                    }));
+                }
+                setShowAddBloodwork(false);
+                setEditingBloodwork(null);
+                setNewBloodwork({ date: getLocalDateString(), tests: [] });
+            };
 
-                const bloodworkEntry = {
-                    id: Date.now(),
-                    date: newBloodwork.date,
-                    tests: newBloodwork.tests
-                };
+            const startEditBloodwork = (entry) => {
+                setEditingBloodwork(entry);
+                setNewBloodwork({ date: entry.date, tests: entry.tests.map(t => ({ ...t })) });
+                setShowAddBloodwork(true);
+            };
 
+            const deleteBloodwork = (entryId) => {
+                if (!confirm('Delete this bloodwork entry? This cannot be undone.')) return;
                 setUsers(prev => ({
                     ...prev,
                     [currentUser]: {
                         ...prev[currentUser],
-                        bloodwork: [...prev[currentUser].bloodwork, bloodworkEntry]
+                        bloodwork: prev[currentUser].bloodwork.filter(b => b.id !== entryId)
                     }
                 }));
-
-                setShowAddBloodwork(false);
-                setNewBloodwork({
-                    date: new Date().toISOString().split('T')[0],
-                    tests: []
-                });
             };
 
             // Add new user
@@ -1911,6 +1971,24 @@
                 </div>
             );
 
+            // ── Shared report helper: open HTML in new window and trigger print-to-PDF ──
+            const openReportForPrint = (html, title) => {
+                const win = window.open('', '_blank');
+                if (!win) { alert('Please allow pop-ups for this app to generate PDF reports.'); return; }
+                win.document.write(html);
+                win.document.close();
+                // Give images/fonts a moment to load, then open print dialog
+                win.onload = () => { win.focus(); win.print(); };
+                // Fallback if onload already fired
+                setTimeout(() => { try { win.focus(); win.print(); } catch(e) {} }, 800);
+            };
+
+            // Local timezone "Generated" stamp  e.g. "March 21, 2026, 10:45 AM"
+            const localGeneratedStamp = () => new Date().toLocaleString('en-US', {
+                month: 'long', day: 'numeric', year: 'numeric',
+                hour: 'numeric', minute: '2-digit', hour12: true
+            });
+
             // ── Bloodwork report generators ───────────────────────────────────
             const exportTrendReport = () => {
                 const sorted = [...bloodwork].sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -1918,7 +1996,6 @@
                     alert('You need at least 2 bloodwork dates to generate a trend report.');
                     return;
                 }
-                // Collect all unique test names across all dates
                 const allTestNames = [];
                 sorted.forEach(r => r.tests.forEach(t => { if (!allTestNames.includes(t.name)) allTestNames.push(t.name); }));
                 const dates = sorted.map(r => new Date(r.date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }));
@@ -1933,39 +2010,40 @@
   th.date-col{text-align:center}
   td{padding:7px 10px;border-bottom:1px solid #e5e7eb;vertical-align:middle}
   td.val{text-align:center;font-weight:600}
-  td.val.high{color:#dc2626}
-  td.val.low{color:#d97706}
-  td.val.normal{color:#16a34a}
-  td.arrow{text-align:center;font-size:16px}
+  td.val.high{color:#dc2626} td.val.low{color:#d97706} td.val.normal{color:#16a34a}
   tr:nth-child(even){background:#fafafa}
   .range{font-size:11px;color:#9ca3af}
   .legend{margin-top:20px;font-size:12px;color:#6b7280}
   .footer{margin-top:30px;padding-top:16px;border-top:1px solid #e5e7eb;color:#9ca3af;font-size:11px}
-  @media print{body{margin:20px}}
+  @media print{
+    body{margin:15mm}
+    @page{size:landscape;margin:15mm}
+    button{display:none}
+  }
 </style></head><body>
-<h1>📈 Lab Results Trend Report</h1>
+<h1>&#x1F4C8; Lab Results Trend Report</h1>
 <div class="meta">
   <strong>Patient:</strong> ${userData.name} &nbsp;|&nbsp;
   <strong>DOB:</strong> ${userData.dateOfBirth} &nbsp;|&nbsp;
-  <strong>Generated:</strong> ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}<br>
-  <strong>Dates covered:</strong> ${dates[0]} → ${dates[dates.length - 1]} &nbsp;(${sorted.length} lab visits)
+  <strong>Generated:</strong> ${localGeneratedStamp()}<br>
+  <strong>Dates covered:</strong> ${dates[0]} &rarr; ${dates[dates.length - 1]} &nbsp;(${sorted.length} lab visits)
 </div>
 <table>
   <thead><tr>
     <th>Test</th><th>Normal Range</th>
     ${dates.map(d => `<th class="date-col">${d}</th>`).join('')}
-    <th class="date-col">Change (first→last)</th>
+    <th class="date-col">Change (first&rarr;last)</th>
   </tr></thead>
   <tbody>`;
                 allTestNames.forEach(name => {
                     const valuesByDate = sorted.map(r => r.tests.find(t => t.name === name) || null);
                     const firstVal = valuesByDate.find(v => v !== null);
                     const lastVal = [...valuesByDate].reverse().find(v => v !== null);
-                    let changeCell = '—';
+                    let changeCell = '&mdash;';
                     if (firstVal && lastVal && firstVal !== lastVal) {
                         const diff = lastVal.value - firstVal.value;
-                        const pct = firstVal.value !== 0 ? ((diff / firstVal.value) * 100).toFixed(1) : '—';
-                        const arrow = diff > 0 ? '▲' : '▼';
+                        const pct = firstVal.value !== 0 ? ((diff / firstVal.value) * 100).toFixed(1) : '&mdash;';
+                        const arrow = diff > 0 ? '&#x25B2;' : '&#x25BC;';
                         const color = lastVal.status === 'normal' ? '#16a34a' : '#dc2626';
                         changeCell = `<span style="color:${color}">${arrow} ${Math.abs(diff).toFixed(1)} (${pct}%)</span>`;
                     }
@@ -1976,30 +2054,22 @@
       <td class="range">${normalRange} ${unit}</td>
       ${valuesByDate.map(v => v
                         ? `<td class="val ${v.status}">${v.value}<br><span style="font-size:10px;font-weight:400;color:#6b7280">${v.unit}</span></td>`
-                        : '<td class="val" style="color:#d1d5db">—</td>'
+                        : '<td class="val" style="color:#d1d5db">&mdash;</td>'
                     ).join('')}
       <td class="val">${changeCell}</td>
     </tr>`;
                 });
                 html += `</tbody></table>
-<div class="legend">🟢 Normal &nbsp; 🔴 Above range &nbsp; 🟡 Below range</div>
-<div class="footer">Generated by MedTrack · For personal reference only · Always discuss results with your healthcare provider</div>
+<div class="legend">&#x1F7E2; Normal &nbsp; &#x1F534; Above range &nbsp; &#x1F7E1; Below range</div>
+<div class="footer">Generated by MedTrack &middot; For personal reference only &middot; Always discuss results with your healthcare provider</div>
 </body></html>`;
-                const blob = new Blob([html], { type: 'text/html' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `lab-trend-report-${userData.name.replace(/\s+/g, '-')}-${new Date().toISOString().split('T')[0]}.html`;
-                document.body.appendChild(a); a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
+                openReportForPrint(html, 'Lab Trend Report');
             };
 
             const exportOutOfRangeReport = () => {
                 const sorted = [...bloodwork].sort((a, b) => new Date(a.date) - new Date(b.date));
                 if (sorted.length === 0) { alert('No bloodwork data found.'); return; }
 
-                // Gather all tests that have ever been out of range
                 const abnormalTests = {};
                 sorted.forEach(result => {
                     result.tests.forEach(t => {
@@ -2007,7 +2077,6 @@
                             if (!abnormalTests[t.name]) abnormalTests[t.name] = { unit: t.unit, normalRange: t.normalRange, entries: [] };
                             abnormalTests[t.name].entries.push({ date: result.date, value: t.value, status: t.status });
                         } else {
-                            // Include the test even for normal readings if it was abnormal at other times
                             if (abnormalTests[t.name]) {
                                 abnormalTests[t.name].entries.push({ date: result.date, value: t.value, status: t.status });
                             }
@@ -2016,7 +2085,7 @@
                 });
 
                 if (Object.keys(abnormalTests).length === 0) {
-                    alert('🎉 All results are within normal range! No out-of-range report needed.');
+                    alert('All results are within normal range! No out-of-range report needed.');
                     return;
                 }
 
@@ -2027,7 +2096,7 @@
   body{font-family:Arial,sans-serif;margin:40px;color:#1f2937;font-size:13px}
   h1{color:#dc2626;border-bottom:3px solid #dc2626;padding-bottom:8px}
   .meta{background:#fef2f2;padding:12px 16px;border-radius:8px;margin:16px 0 24px;font-size:13px}
-  .test-block{border:1px solid #e5e7eb;border-radius:10px;margin-bottom:20px;overflow:hidden}
+  .test-block{border:1px solid #e5e7eb;border-radius:10px;margin-bottom:20px;overflow:hidden;break-inside:avoid}
   .test-header{padding:12px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center}
   .test-name{font-size:16px;font-weight:700;color:#1f2937}
   .badge{padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
@@ -2038,18 +2107,21 @@
   table{width:100%;border-collapse:collapse}
   th{background:#f9fafb;color:#6b7280;padding:6px 16px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
   td{padding:8px 16px;border-top:1px solid #f3f4f6;font-size:13px}
-  .val-high{color:#dc2626;font-weight:700}
-  .val-low{color:#d97706;font-weight:700}
-  .val-normal{color:#16a34a;font-weight:700}
-  .trend-arrow{font-size:14px;margin-left:4px}
-  .summary-box{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:14px 18px;margin:12px 0}
+  .val-high{color:#dc2626;font-weight:700} .val-low{color:#d97706;font-weight:700} .val-normal{color:#16a34a;font-weight:700}
+  .summary-box{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:14px 18px;margin:16px 0}
   .footer{margin-top:30px;padding-top:16px;border-top:1px solid #e5e7eb;color:#9ca3af;font-size:11px}
+  @media print{
+    body{margin:15mm}
+    @page{margin:15mm}
+    .test-block{break-inside:avoid}
+    button{display:none}
+  }
 </style></head><body>
-<h1>🔍 Out-of-Range Progress Report</h1>
+<h1>&#x1F50D; Out-of-Range Progress Report</h1>
 <div class="meta">
   <strong>Patient:</strong> ${userData.name} &nbsp;|&nbsp;
   <strong>DOB:</strong> ${userData.dateOfBirth} &nbsp;|&nbsp;
-  <strong>Generated:</strong> ${new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}<br>
+  <strong>Generated:</strong> ${localGeneratedStamp()}<br>
   <strong>Tracking ${Object.keys(abnormalTests).length} out-of-range test${Object.keys(abnormalTests).length !== 1 ? 's' : ''}</strong> across ${sorted.length} lab visit${sorted.length !== 1 ? 's' : ''}
 </div>`;
 
@@ -2057,18 +2129,16 @@
                     const entries = data.entries.sort((a, b) => new Date(a.date) - new Date(b.date));
                     const first = entries[0];
                     const last = entries[entries.length - 1];
-                    const currentlyAbnormal = last.status !== 'normal';
                     const wasImproving = entries.length > 1 && (
                         last.status === 'normal' ||
                         (first.status === 'high' && last.value < first.value) ||
                         (first.status === 'low' && last.value > first.value)
                     );
-
                     let trendLabel, trendClass;
-                    if (last.status === 'normal') { trendLabel = '✅ Resolved'; trendClass = 'resolved'; }
-                    else if (wasImproving) { trendLabel = '📉 Improving'; trendClass = 'improving'; }
-                    else if (entries.length === 1) { trendLabel = '⚠️ Needs Follow-up'; trendClass = 'stable'; }
-                    else { trendLabel = '📈 Not Improving'; trendClass = 'worsening'; }
+                    if (last.status === 'normal') { trendLabel = 'Resolved'; trendClass = 'resolved'; }
+                    else if (wasImproving) { trendLabel = 'Improving'; trendClass = 'improving'; }
+                    else if (entries.length === 1) { trendLabel = 'Needs Follow-up'; trendClass = 'stable'; }
+                    else { trendLabel = 'Not Improving'; trendClass = 'worsening'; }
 
                     html += `<div class="test-block">
   <div class="test-header">
@@ -2083,19 +2153,18 @@
     <tbody>`;
                     entries.forEach((entry, i) => {
                         const prev = i > 0 ? entries[i - 1] : null;
-                        let changeCell = i === 0 ? '<em style="color:#9ca3af">baseline</em>' : '—';
+                        let changeCell = i === 0 ? '<em style="color:#9ca3af">baseline</em>' : '&mdash;';
                         if (prev) {
                             const diff = entry.value - prev.value;
-                            const arrow = diff > 0 ? '▲' : diff < 0 ? '▼' : '→';
-                            const color = (entry.status === 'normal') ? '#16a34a'
-                                : ((entry.status === first.status) && Math.abs(diff) < 0.01) ? '#d97706'
+                            const arrow = diff > 0 ? '&#x25B2;' : diff < 0 ? '&#x25BC;' : '&rarr;';
+                            const color = entry.status === 'normal' ? '#16a34a'
                                 : wasImproving ? '#16a34a' : '#dc2626';
                             changeCell = `<span style="color:${color}">${arrow} ${Math.abs(diff).toFixed(2)} ${data.unit}</span>`;
                         }
                         html += `<tr>
       <td>${formatDate(entry.date)}</td>
       <td class="val-${entry.status}">${entry.value} ${data.unit}</td>
-      <td>${entry.status === 'normal' ? '<span style="color:#16a34a">✓ Normal</span>' : entry.status === 'high' ? '<span style="color:#dc2626">↑ Above Range</span>' : '<span style="color:#d97706">↓ Below Range</span>'}</td>
+      <td>${entry.status === 'normal' ? '<span style="color:#16a34a">&#x2713; Normal</span>' : entry.status === 'high' ? '<span style="color:#dc2626">&#x2191; Above Range</span>' : '<span style="color:#d97706">&#x2193; Below Range</span>'}</td>
       <td>${changeCell}</td>
     </tr>`;
                     });
@@ -2110,19 +2179,12 @@
 
                 html += `<div class="summary-box">
   <strong>Summary:</strong> ${resolvedCount} of ${total} previously out-of-range test${total !== 1 ? 's' : ''} ${resolvedCount === 1 ? 'has' : 'have'} returned to normal range.
-  ${resolvedCount === total ? '🎉 All tracked values are now within normal limits!' : `${total - resolvedCount} still need${total - resolvedCount === 1 ? 's' : ''} attention.`}
+  ${resolvedCount === total ? 'All tracked values are now within normal limits!' : `${total - resolvedCount} still need${total - resolvedCount === 1 ? 's' : ''} attention.`}
 </div>
-<div class="footer">Generated by MedTrack · For personal reference only · Always discuss results with your healthcare provider</div>
+<div class="footer">Generated by MedTrack &middot; For personal reference only &middot; Always discuss results with your healthcare provider</div>
 </body></html>`;
 
-                const blob = new Blob([html], { type: 'text/html' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `out-of-range-report-${userData.name.replace(/\s+/g, '-')}-${new Date().toISOString().split('T')[0]}.html`;
-                document.body.appendChild(a); a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
+                openReportForPrint(html, 'Out-of-Range Progress Report');
             };
 
             const BloodworkView = () => (
@@ -2137,10 +2199,11 @@
                         </button>
                         <label className="flex-1 bg-green-600 text-white py-3 rounded-lg flex items-center justify-center gap-2 hover:bg-green-700 transition-colors cursor-pointer">
                             <Icon name="scan" />
-                            {uploadingPDF ? 'Scanning...' : 'Scan PDF'}
+                            {uploadingPDF ? 'Scanning...' : 'Scan PDF(s)'}
                             <input
                                 type="file"
                                 accept=".pdf"
+                                multiple
                                 onChange={handlePDFUpload}
                                 className="hidden"
                                 disabled={uploadingPDF}
@@ -2185,22 +2248,30 @@
 
                             return (
                                 <div key={result.id} className="bg-white rounded-lg shadow-md border border-gray-200 overflow-hidden">
-                                    <div
-                                        onClick={() => setExpandedBloodwork(isExpanded ? null : result.id)}
-                                        className="p-4 cursor-pointer hover:bg-gray-50 transition-colors"
-                                    >
-                                        <div className="flex items-center justify-between">
-                                            <div>
-                                                <h4 className="font-semibold text-gray-800">
-                                                    {new Date(result.date).toLocaleDateString('en-US', {
-                                                        month: 'long',
-                                                        day: 'numeric',
-                                                        year: 'numeric'
-                                                    })}
-                                                </h4>
-                                                <p className="text-sm text-gray-500">{result.tests.length} tests</p>
-                                            </div>
-                                            <Icon name={isExpanded ? "chevronUp" : "chevronDown"} />
+                                    <div className="p-4 flex items-center justify-between">
+                                        <div
+                                            className="flex-1 cursor-pointer"
+                                            onClick={() => setExpandedBloodwork(isExpanded ? null : result.id)}
+                                        >
+                                            <h4 className="font-semibold text-gray-800">
+                                                {new Date(result.date + 'T00:00:00').toLocaleDateString('en-US', {
+                                                    month: 'long', day: 'numeric', year: 'numeric'
+                                                })}
+                                            </h4>
+                                            <p className="text-sm text-gray-500">{result.tests.length} tests</p>
+                                        </div>
+                                        <div className="flex items-center gap-2 ml-2">
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); startEditBloodwork(result); }}
+                                                className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-lg hover:bg-blue-200 transition-colors font-medium"
+                                                title="Edit this entry"
+                                            >✏️ Edit</button>
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); deleteBloodwork(result.id); }}
+                                                className="text-xs bg-red-100 text-red-600 px-2 py-1 rounded-lg hover:bg-red-200 transition-colors font-medium"
+                                                title="Delete this entry"
+                                            >🗑️ Delete</button>
+                                            <Icon name={isExpanded ? "chevronUp" : "chevronDown"} className="w-5 h-5 text-gray-400 cursor-pointer" onClick={() => setExpandedBloodwork(isExpanded ? null : result.id)} />
                                         </div>
                                     </div>
 
@@ -2779,8 +2850,8 @@
                             <div className="fixed inset-0 bg-black bg-opacity-50 modal-overlay flex items-center justify-center z-50 p-4 overflow-y-auto">
                                 <div className="bg-white rounded-xl p-6 max-w-2xl w-full my-8">
                                     <div className="flex items-center justify-between mb-4">
-                                        <h2 className="text-2xl font-bold text-gray-800">Add Bloodwork Results</h2>
-                                        <button onClick={() => setShowAddBloodwork(false)} className="text-gray-500 hover:text-gray-700">
+                                        <h2 className="text-2xl font-bold text-gray-800">{editingBloodwork ? 'Edit Bloodwork Results' : 'Add Bloodwork Results'}</h2>
+                                        <button onClick={() => { setShowAddBloodwork(false); setEditingBloodwork(null); setNewBloodwork({ date: getLocalDateString(), tests: [] }); }} className="text-gray-500 hover:text-gray-700">
                                             <Icon name="x" />
                                         </button>
                                     </div>
@@ -2881,10 +2952,10 @@
                                                 onClick={handleAddBloodwork}
                                                 className="flex-1 bg-purple-600 text-white py-2 rounded-lg font-semibold hover:bg-purple-700 transition-colors"
                                             >
-                                                Save Results
+                                                {editingBloodwork ? 'Update Results' : 'Save Results'}
                                             </button>
                                             <button
-                                                onClick={() => setShowAddBloodwork(false)}
+                                                onClick={() => { setShowAddBloodwork(false); setEditingBloodwork(null); setNewBloodwork({ date: getLocalDateString(), tests: [] }); }}
                                                 className="flex-1 bg-gray-200 text-gray-800 py-2 rounded-lg font-semibold hover:bg-gray-300 transition-colors"
                                             >
                                                 Cancel
